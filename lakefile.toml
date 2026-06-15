@@ -1,0 +1,21 @@
+name = "SuperREPL"
+version = "0.1.0"
+defaultTargets = ["superrepl"]
+
+[[lean_lib]]
+name = "SuperREPL"
+
+
+[[require]]
+name = "TrainingData"
+git = "https://github.com/taterowney/lean-training-data"
+rev = "master"
+
+[[lean_exe]]
+name = "superrepl"
+root = "Main"
+
+[[lean_exe]]
+name = "bridge"
+root = "SuperREPL.Bridge"
+supportInterpreter = true

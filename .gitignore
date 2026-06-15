@@ -1,0 +1,7 @@
+/.lake
+__pycache__/
+.env
+.claude
+.venv
+.DS_Store
+*.pyc
