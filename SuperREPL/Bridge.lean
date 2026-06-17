@@ -5,7 +5,9 @@ public import Qq.Macro
 
 public import SuperREPL.Environment
 public import SuperREPL.BridgeInitializer
-public import SuperREPL.Checker
+public import SuperREPL.CheckingUtilities
+
+public import SuperREPL.CheckLean
 
 
 public section

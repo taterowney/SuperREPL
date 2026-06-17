@@ -1,0 +1,15 @@
+aiohappyeyeballs==2.6.2
+aiohttp==3.14.1
+aiosignal==1.4.0
+anyio==4.13.0
+attrs==26.1.0
+certifi==2026.5.20
+frozenlist==1.8.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.18
+multidict==6.7.1
+propcache==0.5.2
+typing_extensions==4.15.0
+yarl==1.24.2

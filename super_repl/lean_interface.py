@@ -82,6 +82,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import signal
 import threading
 import time
 from dataclasses import dataclass
@@ -93,6 +94,11 @@ from .heuristics import StatsTracker
 from .basic import Request
 
 logger = logging.getLogger(__name__)
+
+
+class _BridgeDied(Exception):
+    """Raised internally when the bridge's stdio pipe closes mid-exchange (the
+    process exited/crashed). Signals the worker to restart the process."""
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -181,6 +187,14 @@ _ALWAYS_MODULES: tuple[str, ...] = ("SuperREPL.DefaultTools",)
 # StreamReader limit well above any plausible line.
 _STREAM_LIMIT = 128 * 1024 * 1024  # 128 MiB
 
+# Process exit codes (negative = killed by signal -N) that mark a *deliberate*
+# teardown rather than a crash, so the worker must NOT spawn a replacement. A
+# Ctrl-C / `kill` delivered to the process group hits the Lean children too, and
+# the worker can see the resulting EOF before `close()` has run on the main
+# thread. SIGKILL is intentionally excluded: the crash-recovery path (and an
+# external `kill -9` of a wedged bridge) should still restart.
+_SHUTDOWN_RETURNCODES: frozenset[int] = frozenset({-int(signal.SIGINT), -int(signal.SIGTERM)})
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # LeanInterface — persistent client for the Lean ``bridge`` executable
@@ -256,6 +270,8 @@ class LeanInterface:
         # Latest module-import snapshot reported by the bridge (updated on every
         # response): the modules the Lean process currently has cached.
         self.cached_modules: list[str] = []
+        self._closed = False
+        self._restarts = 0  # how many times the process has been respawned
 
         # Block until the process is up and has reported its methods.
         self._dispatch(self._async_setup())
@@ -264,9 +280,17 @@ class LeanInterface:
 
     async def _async_setup(self) -> None:
         self._queue = asyncio.PriorityQueue()
+        await self._build_modules()
+        await self._spawn_proc()
+        # Single consumer of the priority queue; nothing can enqueue until the
+        # constructor returns, so starting it here (after the manifest) is safe.
+        self._worker_task = self._loop.create_task(self._worker())
+        logger.info("Lean bridge (id=%s) ready; methods: %s", self.id, sorted(self._method_map))
 
-        # Build the requested modules first; fail loudly if any error or are
-        # not found (lake returns nonzero and prints diagnostics).
+    async def _build_modules(self) -> None:
+        """Build the requested modules; fail loudly if any error or are missing
+        (lake returns nonzero and prints diagnostics). Done once, at startup —
+        restarts reuse the already-built artifacts."""
         build = await asyncio.create_subprocess_exec(
             "lake", "build", *self.lean_modules, cwd=self._cwd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -278,8 +302,13 @@ class LeanInterface:
                 f"(exit {build.returncode}):\n{out.decode(errors='replace')}"
             )
 
+    async def _spawn_proc(self) -> None:
+        """Spawn the bridge process, start draining its stderr, and consume the
+        startup manifest. Reused for both initial setup and restarts; a fresh
+        process starts with nothing cached, so the manifest tables and the
+        cached-module snapshot are (re)populated here."""
         cmd = ["lake", "exe", "bridge", "--import", ",".join(self.lean_modules)]
-        logger.info("Starting Lean bridge: %s (cwd=%s)", " ".join(cmd), self._cwd)
+        logger.info("Starting Lean bridge (id=%s): %s (cwd=%s)", self.id, " ".join(cmd), self._cwd)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             cwd=self._cwd,
@@ -292,6 +321,7 @@ class LeanInterface:
         # Drain stderr so the process can't block on a full pipe; surface it
         # for debugging (lake build output, Lean errors, etc.).
         self._stderr_task = self._loop.create_task(self._drain_stderr())
+        self.cached_modules = []  # a fresh process holds nothing yet
 
         try:
             manifest = await asyncio.wait_for(
@@ -302,6 +332,8 @@ class LeanInterface:
                 f"Lean bridge did not report its methods within {self._ready_timeout}s"
             ) from exc
 
+        self._method_defs.clear()
+        self._method_map.clear()
         for entry in manifest:
             td = self._method_def_from_manifest(entry)
             if td is None:
@@ -310,11 +342,6 @@ class LeanInterface:
                 logger.warning("Duplicate method name %r from bridge", td.name)
             self._method_map[td.name] = td
             self._method_defs.append(td)
-
-        # Single consumer of the priority queue; nothing can enqueue until the
-        # constructor returns, so starting it here (after the manifest) is safe.
-        self._worker_task = self._loop.create_task(self._worker())
-        logger.info("Lean bridge ready; methods: %s", sorted(self._method_map))
 
     @staticmethod
     def _method_def_from_manifest(entry: dict[str, Any]) -> MethodDef | None:
@@ -350,14 +377,15 @@ class LeanInterface:
 
     async def _read_line(self) -> str:
         """Read one JSON line from the bridge, skipping the blank lines it emits
-        after each message. Raises if the process has closed stdout (exited)."""
+        after each message. Raises :class:`_BridgeDied` if the process has closed
+        stdout (exited/crashed)."""
         if self._proc is None or self._proc.stdout is None:
-            raise RuntimeError("Lean bridge process is not running")
+            raise _BridgeDied("bridge process is not running")
         while True:
             raw = await self._proc.stdout.readline()
             if raw == b"":
-                raise RuntimeError(
-                    f"Lean bridge closed stdout (exited, returncode={self._proc.returncode})"
+                raise _BridgeDied(
+                    f"closed stdout (exited, returncode={self._proc.returncode})"
                 )
             line = raw.decode(errors="replace").strip()
             if line:
@@ -378,13 +406,17 @@ class LeanInterface:
         return [e for e in data if isinstance(e, dict)]
 
     async def _drain_stderr(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
+        # Bind to this process's stream so a restart (which swaps `self._proc`)
+        # can never make this task read a different process's stderr.
+        proc = self._proc
+        if proc is None or proc.stderr is None:
             return
+        stream = proc.stderr
         while True:
-            raw = await self._proc.stderr.readline()
+            raw = await stream.readline()
             if raw == b"":
                 break
-            logger.debug("[bridge stderr] %s", raw.decode(errors="replace").rstrip())
+            logger.debug("[bridge stderr id=%s] %s", self.id, raw.decode(errors="replace").rstrip())
 
     # ── Internal: dispatch to background loop ────────────────────
 
@@ -424,10 +456,6 @@ class LeanInterface:
         return td
 
     # ── Scheduling estimates ─────────────────────────────────────
-    # Ported from the dummy ``LeanProcess`` so a real bridge is a drop-in for the
-    # routing policy. Structural counts (queue depth, missing modules) live here;
-    # the per-unit time estimates come from :class:`StatsTracker`, which owns the
-    # statistic (currently an average) so it can be swapped without touching this.
 
     @property
     def load(self) -> int:
@@ -578,7 +606,10 @@ class LeanInterface:
         """Single consumer of the request queue: pull the highest-priority
         queued call (FIFO within a priority) and run it to completion before
         taking the next, so the bridge only ever sees one request at a time. A
-        ``None`` payload is a shutdown sentinel."""
+        ``None`` payload is a shutdown sentinel.
+
+        If the bridge dies mid-call, the worker (the only thing that touches
+        stdio) restarts it and retries the request once."""
         assert self._queue is not None
         while True:
             _prio, _seq, job = await self._queue.get()
@@ -588,16 +619,136 @@ class LeanInterface:
                 if job.future.done():  # caller already gave up; skip the work
                     continue
                 try:
-                    result = await self._execute_call(
-                        job.name, job.arguments,
-                        query_imports=job.query_imports, timeout=job.timeout,
-                    )
-                    job.future.set_result(result)
-                except Exception as exc:  # defensive: _execute_call returns errors
+                    result = await self._execute_with_restart(job)
+                    if not job.future.done():
+                        job.future.set_result(result)
+                except Exception as exc:  # defensive: should not normally happen
                     if not job.future.done():
                         job.future.set_exception(exc)
             finally:
                 self._queue.task_done()
+
+    async def _execute_with_restart(self, job: _QueuedCall) -> MethodResult:
+        """Run one job, restarting the bridge and retrying once if its pipe dies.
+
+        A request that reliably crashes the bridge is retried exactly once (and
+        the process is restarted afterward regardless) so a poisoned request can
+        never wedge the worker in a crash/restart loop — it just returns an error
+        while leaving a healthy process for the next request.
+
+        A death that is really a deliberate shutdown (we are closing, or the
+        process was taken down with the group via Ctrl-C / SIGTERM) is never
+        retried or restarted — see :meth:`_is_intentional_shutdown`."""
+        try:
+            return await self._execute_call(
+                job.name, job.arguments,
+                query_imports=job.query_imports, timeout=job.timeout,
+            )
+        except _BridgeDied as died:
+            if await self._is_intentional_shutdown():
+                logger.info(
+                    "Lean bridge (id=%s) exited during shutdown (%s); not restarting",
+                    self.id, died,
+                )
+                raise
+            method = self._method_for(job.name)
+            logger.warning("Lean bridge (id=%s) closed its pipe (%s); restarting", self.id, died)
+            try:
+                await self._restart()
+            except Exception as exc:
+                return MethodResult(
+                    method=method,
+                    content=f"Lean bridge crashed and could not be restarted: {exc}",
+                    is_error=True,
+                )
+
+        # One retry on the freshly restarted process.
+        try:
+            return await self._execute_call(
+                job.name, job.arguments,
+                query_imports=job.query_imports, timeout=job.timeout,
+            )
+        except _BridgeDied as died:
+            if await self._is_intentional_shutdown():
+                logger.info(
+                    "Lean bridge (id=%s) exited during shutdown (%s); not restarting",
+                    self.id, died,
+                )
+                raise
+            logger.error(
+                "Lean bridge (id=%s) died again after restart (%s); failing this request",
+                self.id, died,
+            )
+            # Restore a healthy process for subsequent requests; the crash was
+            # most likely caused by this particular request.
+            try:
+                await self._restart()
+            except Exception:
+                pass
+            return MethodResult(
+                method=self._method_for(job.name),
+                content=f"Lean bridge crashed repeatedly while handling this request: {died}",
+                is_error=True,
+            )
+
+    async def _is_intentional_shutdown(self) -> bool:
+        """Whether a just-detected bridge death is a deliberate teardown rather
+        than a crash — in which case the worker must NOT restart the process.
+
+        True when we are already closing (:attr:`_closed`), or when the process
+        exited because of SIGINT/SIGTERM. The signal check closes a race: a
+        Ctrl-C/terminate sent to the whole process group kills the Lean child
+        too, and the worker (on its own background thread, immune to the main
+        thread's KeyboardInterrupt) can see the resulting EOF *before*
+        :meth:`close` has run — which used to look like a crash and spawn a
+        doomed replacement mid-shutdown.
+        """
+        if self._closed:
+            return True
+        proc = self._proc
+        if proc is None:
+            return False
+        rc = proc.returncode
+        if rc is None:
+            # EOF can arrive a beat before the child is reaped; wait briefly so
+            # we can read the real exit code (and thus the killing signal).
+            try:
+                rc = await asyncio.wait_for(proc.wait(), timeout=2)
+            except Exception:
+                return False
+        return rc in _SHUTDOWN_RETURNCODES
+
+    def _method_for(self, name: str) -> MethodDef:
+        return self._method_map.get(name) or MethodDef(
+            name=name, description="", input_schema=dict(OPEN_SCHEMA)
+        )
+
+    async def _restart(self) -> None:
+        """Replace a dead (or to-be-killed) bridge process with a fresh one. Runs
+        on the worker, so no request touches stdio while it happens."""
+        self._restarts += 1
+        await self._kill_proc()
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        await self._spawn_proc()
+        logger.info("Lean bridge (id=%s) restarted (restart #%d)", self.id, self._restarts)
+
+    async def _kill_proc(self) -> None:
+        """Ensure the current process is dead and reaped."""
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except Exception:
+            pass
 
     async def _execute_call(
         self,
@@ -625,9 +776,7 @@ class LeanInterface:
         request = (json.dumps(payload) + "\n\n").encode()
 
         if self._proc is None or self._proc.stdin is None:
-            return MethodResult(
-                method=method, content="Lean bridge is not running", is_error=True
-            )
+            raise _BridgeDied("bridge process is not running")
         # Time the round trip so the cache policy can reason about how long the
         # Lean process spends per call (import time is split out via the stats
         # the bridge reports below).
@@ -642,15 +791,20 @@ class LeanInterface:
                 else await read
             )
         except asyncio.TimeoutError:
+            # A timeout is not a crash — the process is presumed alive (the call
+            # may still be running), so we surface an error result rather than
+            # restarting. The stream may now be desynced for the next call.
             logger.warning("Lean method %r timed out after %.1fs", name, timeout or 0.0)
             return MethodResult(
                 method=method,
                 content=f"Method {name!r} timed out after {timeout}s",
                 is_error=True,
             )
-        except Exception as exc:  # process died, broken pipe, etc.
-            logger.warning("Lean method %r raised: %s", name, exc)
-            return MethodResult(method=method, content=f"Method error: {exc}", is_error=True)
+        except _BridgeDied:
+            raise  # closed stdout (EOF) from `_read_line`; let the worker restart
+        except (BrokenPipeError, ConnectionResetError, OSError) as exc:
+            # Writing to a dead process's stdin -> the pipe is gone; treat as death.
+            raise _BridgeDied(f"stdio pipe broke: {exc}") from exc
         total_time = time.perf_counter() - started
 
         try:
@@ -713,7 +867,10 @@ class LeanInterface:
     # ── Lifecycle ────────────────────────────────────────────────
 
     def close(self) -> None:
-        """Stop the bridge process and the background loop."""
+        """Stop the bridge process and the background loop. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._dispatch(self._async_close())
         finally:

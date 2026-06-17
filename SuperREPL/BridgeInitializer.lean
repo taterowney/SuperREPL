@@ -4,6 +4,8 @@ public import Lean.Elab.Command
 public import Lean.Meta.Eval
 public import Qq.Macro
 public import Qq.Typ
+public import Std
+
 
 /-! IMPORTANT: when running this as an executable, this module must be `meta import`ed for the attribute to be available.-/
 
@@ -29,6 +31,7 @@ structure RegisteredMethodInfo where
   isInternal : Bool := false
 deriving Inhabited
 
+initialize methodCompilationCache : IO.Ref (Std.HashMap Name ((Json → CommandElabM Json) × (Option (Json → CommandElabM Json)))) ← IO.mkRef {}
 
 instance : ToJson RegisteredMethodInfo where
   toJson info := Json.mkObj
@@ -96,14 +99,15 @@ unsafe def materializeFunction (fn_expr : Expr) (args : List (Name × Expr)) : T
     core json_args)
 
 
-def RegisteredMethodInfo.getFunction (self : RegisteredMethodInfo) : TermElabM <| Json → CommandElabM Json :=
-  unsafe materializeFunction self.fn self.args
+def RegisteredMethodInfo.getFunction (self : RegisteredMethodInfo) : TermElabM <| Json → CommandElabM Json := do
+  let out := (← methodCompilationCache.get).get? self.name |>.map Prod.fst -- Try to get the method from the cache...
+  out.getDM <| unsafe materializeFunction self.fn self.args -- Otherwise recompile it
 
 def RegisteredMethodInfo.getImportsFunction (self : RegisteredMethodInfo) : TermElabM <| Option <| Json → CommandElabM Json :=
   match self.importsFn with
   | some importsFn => do
-    let fn := unsafe materializeFunction importsFn self.args
-    pure <| some (← fn)
+    let out := (← methodCompilationCache.get).get? self.name |>.map Prod.snd |>.bind id -- Try to get the imports function from the cache...
+    out.getDM <| unsafe materializeFunction importsFn self.args -- Otherwise recompile it
   | none => pure none
 
 
@@ -188,11 +192,11 @@ private def getMethodInfo (declName : Name) (attributeSyntax : Syntax) : Command
 
 /-- Exposes a method to Python. The method must be a constant with an executable value (i.e. a function or a def with no arguments). The method must have a docstring, which will be used as the description in the API docs. All argument and return types must have FromJson/ToJson instances, and the JSON keys for the arguments are taken from their names.
 
-Provide an optional function to indicate this method imports modules and should be cached as such; the additional function should have the same arguments as the method, and return an `Array Name` of modules to be imported. Caching logic assumes that `importModules'` from TrainingData is used, as this caches the modules themselves locally to avoid redundant imports. -/
+Provide an optional function to indicate this method imports modules and should be cached as such; the additional function should have the same arguments as the method, and return an `Array Name` of modules to be imported. Caching logic assumes that `importModulesCached` from SuperREPL.Environment is used, as this caches the modules themselves locally to avoid redundant imports. -/
 initialize exposeAttr : ParametricAttribute RegisteredMethodInfo ←
   registerParametricAttribute {
     name := `expose_python_stx
-    descr := "Exposes a method to Python. The method must be a constant with an executable value (i.e. a function or a def with no arguments). The method must have a docstring, which will be used as the description in the API docs. All argument and return types must have FromJson/ToJson instances, and the JSON keys for the arguments are taken from their names.\n\nProvide an optional function to indicate this method imports modules and should be cached as such; the additional function should have the same arguments as the method, and return an `Array Name` of modules to be imported. Caching logic assumes that `importModules'` from TrainingData is used, as this caches the modules themselves locally to avoid redundant imports."
+    descr := "Exposes a method to Python. The method must be a constant with an executable value (i.e. a function or a def with no arguments). The method must have a docstring, which will be used as the description in the API docs. All argument and return types must have FromJson/ToJson instances, and the JSON keys for the arguments are taken from their names.\n\nProvide an optional function to indicate this method imports modules and should be cached as such; the additional function should have the same arguments as the method, and return an `Array Name` of modules to be imported. Caching logic assumes that `importModulesCached` from SuperREPL.Environment is used, as this caches the modules themselves locally to avoid redundant imports."
     applicationTime := .afterCompilation
     getParam := fun decl stx => do
       let prog : CommandElabM _ := getMethodInfo decl stx

@@ -6,6 +6,7 @@ import Lean
 public import TrainingData.Syntax
 public meta import SuperREPL.BridgeInitializer
 public import TrainingData.Environment.CacheImports
+public import TrainingData.Utils.Dependencies
 public import SuperREPL.Environment
 
 public section
@@ -13,10 +14,28 @@ public section
 open Lean Meta Elab Expr Term Command
 
 
-/-- Build a fresh `Environment` containing the given `imports`. -/
+initialize freshEnvCache : IO.Ref (Std.HashMap String Environment) ← IO.mkRef {}
+
+private def freshEnvCacheKey (imports : Array Import) : String :=
+  String.intercalate "," (imports.map (fun i => s!"{i.module}{i.importAll}{i.isExported}{i.isMeta}")).toList
+
+def getEnvFromCache (imports : Array Import) : IO (Option Environment) := do
+  let key := freshEnvCacheKey imports
+  return (← freshEnvCache.get).get? key
+
+def addEnvToCache (imports : Array Import) (env : Environment) : IO Unit := do
+  let key := freshEnvCacheKey imports
+  freshEnvCache.modify (fun m => m.insert key env)
+
+/-- Build a fresh `Environment` containing the given `imports`. Cached. -/
 def freshEnvironment (imports : Array Import) : IO Environment := do
-  -- Caches existing imported modules to memory and saves a bunch of startup time
-  importModulesCached imports {} (loadExts := true) (level := OLeanLevel.exported)
+  match ← getEnvFromCache imports with
+  | some env => return env
+  | none =>
+    -- Caches existing imported modules to memory and saves a bunch of startup time
+    let env ← importModulesCached imports {} (loadExts := true) (level := OLeanLevel.exported)
+    addEnvToCache imports env
+    return env
 
 
 /-- Run a `CommandElabM` action against a fresh environment built from `imports`.
@@ -26,6 +45,13 @@ line/column locations (an empty `source` keeps the degenerate default map). -/
 unsafe def withFreshCommandElabM (imports : Array Import) (prog : CommandElabM α) (source : String := "") : IO (Environment × α) := do
   enableInitializersExecution
   let env ← freshEnvironment imports
+  let state := { (Command.mkState env {} {}) with infoState.enabled := true }
+  match ← prog.run { fileName := "<input>", fileMap := FileMap.ofString source, snap? := none, cancelTk? := none } |>.run state |>.toIO' with
+  | .ok (result, newState) => return (newState.env, result)
+  | .error err => throw <| IO.userError s!"Error elaborating commands: {← err.toMessageData.toString}"
+
+unsafe def withCommandElabMFromEnv (env : Environment) (prog : CommandElabM α) (source : String := "") : IO (Environment × α) := do
+  enableInitializersExecution
   let state := { (Command.mkState env {} {}) with infoState.enabled := true }
   match ← prog.run { fileName := "<input>", fileMap := FileMap.ofString source, snap? := none, cancelTk? := none } |>.run state |>.toIO' with
   | .ok (result, newState) => return (newState.env, result)
@@ -82,7 +108,6 @@ structure FullCheckResult where
   sorries : Array SorryInfo
   axiomsOk : Bool
   disallowedAxioms : Array String
-  problemComplete : Bool
   decls : Array String
   deriving ToJson
 
@@ -315,64 +340,7 @@ def checkCommandsFull (commands : Array (TSyntax `command)) (decls : Array Strin
   return {
     ok := ok, status := status, errors := errors, sorries := sorries,
     axiomsOk := axiomsOk, disallowedAxioms := disallowed,
-    problemComplete := problemComplete, decls := decls
+    decls := decls
   }
-
-
-/-- Checks the validity of the provided Lean code, returning a structured
-`FullCheckResult` (errors with spans, `sorry` goals with spans, and the axiom
-verdict — enough to reconstruct a Python `LeanCheckResult`). `imports` is an
-array of module names imported into a fresh environment before checking;
-`codeWithoutImportStatements` is the Lean code to check (excluding any `import`
-statements). A syntax error during parsing is surfaced as a single `error`
-entry (without a structured span) rather than as a thrown exception. -/
-@[expose_python (fun imports _ => do return imports)]
-unsafe def checkLean (imports : Array Name) (codeWithoutImportStatements : String) : CommandElabM FullCheckResult := do
-  let importArr := #[{module := `Init}] ++ (imports.map (fun m => { module := m }))
-  let (_, result) ← withFreshCommandElabM importArr (source := codeWithoutImportStatements) do
-    let parsedRes ← (do
-      try
-        let cmds ← parseCommands codeWithoutImportStatements (← getEnv)
-        pure (Except.ok cmds.toArray)
-      catch e =>
-        pure (Except.error (← e.toMessageData.toString)))
-    match parsedRes with
-    | .error errStr =>
-        pure {
-          ok := false, status := "error",
-          errors := #[{ message := errStr, span := none }],
-          sorries := #[], axiomsOk := false, disallowedAxioms := #[],
-          problemComplete := false, decls := #[]
-        }
-    | .ok cmds =>
-        checkCommandsFull (cmds.map Prod.snd) (cmds.map Prod.fst) none
-  return result
-
-
--- unsafe def solveWithAutomation (imports : Array Name) (codeWithoutImportStatements : String) : CommandElabM FullCheckResult := do
---   let importArr := #[{module := `Init}] ++ (imports.map (fun m => { module := m }))
---   let (_, result) ← withFreshCommandElabM importArr (source := codeWithoutImportStatements) do
---     let parsedRes ← (do
---       try
---         let cmds ← parseCommands codeWithoutImportStatements (← getEnv)
---         pure (Except.ok cmds.toArray)
---       catch e =>
---         pure (Except.error (← e.toMessageData.toString)))
-
---     match parsedRes with
---     | .error errStr =>
---         pure {
---           ok := false, status := "error",
---           errors := #[{ message := errStr, span := none }],
---           sorries := #[], axiomsOk := false, disallowedAxioms := #[],
---           problemComplete := false, decls := #[]
---         }
---     | .ok cmds =>
---         let tac ← `(by auto_solve)
---         let cmds ← cmds.mapM (fun (name, decl) =>do
---           let out ← replaceValueIfSorry decl tac
---           return (name, out))
---         checkCommandsFull (cmds.map Prod.snd) (cmds.map Prod.fst) none
---   return result
 
 end
