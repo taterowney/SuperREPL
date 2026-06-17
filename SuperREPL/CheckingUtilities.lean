@@ -109,6 +109,7 @@ structure FullCheckResult where
   axiomsOk : Bool
   disallowedAxioms : Array String
   decls : Array String
+  messages : Array String
   deriving ToJson
 
 
@@ -283,64 +284,5 @@ def collectSorryInfos (trees : List InfoTree) : CommandElabM (Array SorryInfo) :
       out := out.push { goal := goalFmt.pretty.trimAscii.toString, span := some (mkSpanFromPos pos endPos) }
   return out
 
-/-- Elaborate `commands` in sequence and report a full `LeanCheckResult`-shaped
-verdict: every error (with span), every `sorry` (with goal + span), the
-axiom-soundness verdict, and whether any new declaration's type is defeq to
-`targetType`.
-
-Unlike a fail-fast checker, this does NOT short-circuit on the first error or
-`sorry` — it elaborates the whole block so the caller sees all diagnostics at
-once, matching the REPL's `check`. Each command's logged errors and info trees
-accumulate in the command state; we read them out afterwards. -/
-def checkCommandsFull (commands : Array (TSyntax `command)) (decls : Array String)
-    (targetType : Option Expr := none) : CommandElabM FullCheckResult := do
-  let originalEnv ← getEnv
-
-  for cmd in commands do
-    try
-      elabCommand cmd
-    catch ex =>
-      -- `elabCommand` logs most elaboration errors itself; this catches the
-      -- rare hard throw and records it in the message log so it is collected
-      -- below (preserving its span when the exception carries a ref).
-      match ex with
-      | .error ref msg => logErrorAt ref msg
-      | _ => logError m!"{(← ex.toMessageData.toString)}"
-
-  let errors ← collectErrorInfos
-  let sorries ← collectSorryInfos (← get).infoState.trees.toList
-
-  -- Axiom analysis over the newly-added declarations. `sorryAx` is reported via
-  -- `sorries` (and forces `axiomsOk := false`); any other non-kernel axiom is
-  -- collected into `disallowedAxioms`. This does not affect `ok` — it backs the
-  -- separate `check_axioms` gate, exactly as in the REPL.
-  let newConsts := getNewConstants originalEnv (← getEnv)
-  let mut disallowed : Array String := #[]
-  let mut usesSorryAx := false
-  let mut problemComplete := false
-  for (constName, info) in newConsts do
-    let axioms := getAxioms info (← getEnv)
-    if sorryAxiom ∈ axioms then
-      usesSorryAx := true
-    for ax in axioms do
-      if ax != sorryAxiom && !allowedAxioms.contains ax then
-        disallowed := disallowed.push s!"{constName} uses {ax}"
-    if let some targetType := targetType then
-      if ← liftTermElabM <| isDefEqGuarded targetType info.type then
-        problemComplete := true
-
-  let ok := errors.isEmpty && sorries.isEmpty
-  let axiomsOk := disallowed.isEmpty && !usesSorryAx
-  let status :=
-    if !errors.isEmpty then "error"
-    else if !sorries.isEmpty then "typechecksWithSorry"
-    else if problemComplete then "problemComplete"
-    else if !axiomsOk then "disallowedAxiom"
-    else "typechecks"
-  return {
-    ok := ok, status := status, errors := errors, sorries := sorries,
-    axiomsOk := axiomsOk, disallowedAxioms := disallowed,
-    decls := decls
-  }
 
 end

@@ -195,7 +195,8 @@ TODO:
 - [ ] Custom monads can be used by exposed functions so we don't have to deal with refs?
 - [X] Imports processing
 - [X] Modularize Python side
-- [ ] Benchmark + improve caching policy
+- [X] Benchmark + improve caching policy
 - [ ] Send import diff instead of every time
 - [ ] Edge cases in Lean-side environment caching; what if the next input extends the current command instead of making a new one?
 - [ ] Dynlib loading to support arbitrary unsafe code (Lean.loadDynlib)
+- [ ] Return messages after processing

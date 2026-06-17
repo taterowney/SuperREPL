@@ -11,35 +11,6 @@ public section
 
 open Lean Meta Elab Command
 
-/-- Checks the validity of the provided Lean code, returning a structured
-`FullCheckResult` (errors with spans, `sorry` goals with spans, and the axiom
-verdict — enough to reconstruct a Python `LeanCheckResult`). `imports` is an
-array of module names imported into a fresh environment before checking;
-`codeWithoutImportStatements` is the Lean code to check (excluding any `import`
-statements). A syntax error during parsing is surfaced as a single `error`
-entry (without a structured span) rather than as a thrown exception. -/
--- @[expose_python (fun imports _ => do return (← collectDependenciesCached imports).map Prod.fst)]
-unsafe def checkLeanOld (imports : Array Name) (codeWithoutImportStatements : String) : CommandElabM FullCheckResult := do
-  let importArr := #[{module := `Init}] ++ (imports.map (fun m => { module := m }))
-  let (_, result) ← withFreshCommandElabM importArr (source := codeWithoutImportStatements) do
-    let parsedRes ← (do
-      try
-        let cmds ← parseCommands codeWithoutImportStatements (← getEnv)
-        pure (Except.ok cmds.toArray)
-      catch e =>
-        pure (Except.error (← e.toMessageData.toString)))
-    match parsedRes with
-    | .error errStr =>
-        pure {
-          ok := false, status := "error",
-          errors := #[{ message := errStr, span := none }],
-          sorries := #[], axiomsOk := false, disallowedAxioms := #[],
-          decls := #[]
-        }
-    | .ok cmds =>
-        checkCommandsFull (cmds.map Prod.snd) (cmds.map Prod.fst) none
-  return result
-
 
 def String.leftOverlap (s1 s2 : String) : String :=
   s1.chars.zip s2.chars |>.fold (fun (acc, stop) (c1, c2) => if c1 == c2 && !stop then (acc.push c1, false) else (acc, true)) ("", false) |>.fst
@@ -87,6 +58,8 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
 
   let axioms_ok := axioms.all (· ∈ allowedAxioms)
 
+  let msgs ← steps.map (·.msgs.toArray) |>.flatten.mapM (·.toString)
+
   return {
     ok := sorries.isEmpty && errors.isEmpty,
     status := if !errors.isEmpty then "error"
@@ -98,6 +71,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
     axiomsOk := axioms_ok,
     disallowedAxioms := axioms.filter (· ∉ allowedAxioms) |>.map toString,
     decls := decls
+    messages := msgs
   }
 
 
