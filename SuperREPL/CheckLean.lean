@@ -37,6 +37,7 @@ def String.isBoundaryPrefix (s candidate : String) : Bool :=
 instance : Ord Name where
   compare n1 n2 := compare n1.toString n2.toString
 
+
 def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult := do
   let errors ← steps.map IO.CompilationStep.errors |>.toList.flatten.toArray |>.mapM (fun msg => do
     let text ← msg.data.toString
@@ -58,7 +59,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
 
   let axioms_ok := axioms.all (· ∈ allowedAxioms)
 
-  let msgs ← steps.map (·.msgs.toArray) |>.flatten.mapM (·.toString)
+  let msgs ← steps.map (·.msgs.toArray) |>.flatten.mapM (fun m => Message.toMessageInfo m)
 
   return {
     ok := sorries.isEmpty && errors.isEmpty,
@@ -70,7 +71,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
     sorries := sorries,
     axiomsOk := axioms_ok,
     disallowedAxioms := axioms.filter (· ∉ allowedAxioms) |>.map toString,
-    decls := decls
+    decls := decls,
     messages := msgs
   }
 

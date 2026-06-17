@@ -63,6 +63,13 @@ structure Span where
   endLine : Nat
   endColumn : Nat
 
+
+/-- Build a `Span` from a start/end `Lean.Position` pair. -/
+def mkSpanFromPos (pos endPos : Position) : Span :=
+  { startLine := pos.line, startColumn := pos.column,
+    endLine := endPos.line, endColumn := endPos.column }
+
+
 /-- Outcome of `checkCommands`. -/
 inductive CheckResult
   | typechecks -- Everything typechecks; the goal problem hasn't been solved yet
@@ -91,6 +98,28 @@ structure SorryInfo where
   span : Option Span
   deriving ToJson
 
+
+/-- A single message emitted while elaborating a block of Lean code: its
+severity (`"error"` / `"warning"` / `"info"`), the rendered text, and the source
+span it was reported at (if it carried a position). -/
+structure MessageInfo where
+  severity : String
+  data : String
+  span : Option Span
+  deriving ToJson
+
+def Lean.Message.toMessageInfo (msg : Message) : IO MessageInfo := do
+  let sev := match msg.severity with
+    | MessageSeverity.error => "error"
+    | MessageSeverity.warning => "warning"
+    | MessageSeverity.information => "info"
+  let text ← msg.data.toString
+  return {
+    severity := sev, data := text,
+    span := some (mkSpanFromPos msg.pos (msg.endPos.getD msg.pos))
+  }
+
+
 /-- The full result of `checkLean`, carrying everything needed to reconstruct a
 `LeanCheckResult` (`ok`/`errors`/`sorries`) plus the axiom-soundness verdict
 (`axiomsOk`/`disallowedAxioms`, feeding `check_axioms`) and the `problemComplete`
@@ -109,7 +138,7 @@ structure FullCheckResult where
   axiomsOk : Bool
   disallowedAxioms : Array String
   decls : Array String
-  messages : Array String
+  messages : Array MessageInfo
   deriving ToJson
 
 
@@ -248,10 +277,6 @@ def sorries (t : InfoTree) : List (ContextInfo × SorryType × Position × Posit
 
 end SorryScan
 
-/-- Build a `Span` from a start/end `Lean.Position` pair. -/
-def mkSpanFromPos (pos endPos : Position) : Span :=
-  { startLine := pos.line, startColumn := pos.column,
-    endLine := endPos.line, endColumn := endPos.column }
 
 /-- Collect every error-severity message currently in the command message log,
 each tagged with the source span it was reported at. This mirrors how the REPL
