@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "super-repl"
+version = "0.1.0"
+description = "Fast, batched, client/server Lean 4 proof-checking utilities."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",   # Client side
+    "aiohttp>=3.9"
+]
+
+[project.scripts]
+# Serve a pool over HTTP (equivalent to `python -m super_repl.service`).
+super-repl-server = "super_repl.service:_main"
+
+[tool.setuptools]
+# The Python package lives alongside the Lean project (the `SuperREPL/` dir), so
+# pin it explicitly rather than autodiscovering across the whole repo.
+packages = ["super_repl"]
