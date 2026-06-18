@@ -81,14 +81,9 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
 initialize prefixEnvironmentCache : IO.Ref (Option (Array Import × String × Environment × Array IO.CompilationStep)) ← IO.mkRef none
 
 
-def getImportsFromSrc : String → CommandElabM (Array Name) := fun code => do return (← collectDependenciesCached ((← parseImports'' code "<input>").imports.map (·.module))).map Prod.fst
 
-/-- Checks a supplied piece of Lean code, returning information about errors, `sorry` goals, nonstandard axioms, and created declarations.
 
-Implements significant caching logic to speed up repeated checks of similar code. Works best when similar queries (those which have the same imports and begin with the same source code) are sent in sequence.
--/
-@[expose_python getImportsFromSrc]
-unsafe def checkLean (leanCode : String) : CommandElabM FullCheckResult := do
+unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.CompilationStep) := do
   enableInitializersExecution
 
   let imports := (← parseImports'' leanCode "<input>").imports
@@ -151,15 +146,28 @@ unsafe def checkLean (leanCode : String) : CommandElabM FullCheckResult := do
       for step in IO.processInput' source (some env) do
         steps := steps.push step
 
-      toResult steps
+      return steps
 
     else -- If there is no valid overlap, we keep the entire source cached instead of caching an empty string so it doesn't get stuck
       for step in IO.processInput' source (some env) do
         steps := steps.push step
       prefixEnvironmentCache.set (some (imports, source, env, steps))
-      toResult steps
+      return steps
   else
     throwError "Assertion failed: actualSourcePrefix was unset"
+
+
+
+def getImportsFromSrc : String → CommandElabM (Array Name) := fun code => do return (← collectDependenciesCached ((← parseImports'' code "<input>").imports.map (·.module))).map Prod.fst
+
+/-- Checks a supplied piece of Lean code, returning information about errors, `sorry` goals, nonstandard axioms, and created declarations.
+
+Implements significant caching logic to speed up repeated checks of similar code. Works best when similar queries (those which have the same imports and begin with the same source code) are sent in sequence.
+-/
+@[expose_python getImportsFromSrc]
+unsafe def checkLean (leanCode : String) : CommandElabM FullCheckResult := do
+  let steps ← compilationStepsCached leanCode
+  toResult steps
 
 
 
