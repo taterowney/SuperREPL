@@ -199,4 +199,3 @@ TODO:
 - [ ] Send import diff instead of every time
 - [ ] Edge cases in Lean-side environment caching; what if the next input extends the current command instead of making a new one?
 - [ ] Dynlib loading to support arbitrary unsafe code (Lean.loadDynlib)
-- [ ] Return messages after processing
