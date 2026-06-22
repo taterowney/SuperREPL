@@ -119,6 +119,12 @@ def Lean.Message.toMessageInfo (msg : Message) : IO MessageInfo := do
     span := some (mkSpanFromPos msg.pos (msg.endPos.getD msg.pos))
   }
 
+structure LeanDeclaration where
+  name : Name
+  type : String
+  src : String
+  has_sorry : Bool
+deriving ToJson
 
 /-- The full result of `checkLean`, carrying everything needed to reconstruct a
 `LeanCheckResult` (`ok`/`errors`/`sorries`) plus the axiom-soundness verdict
@@ -137,7 +143,7 @@ structure FullCheckResult where
   sorries : Array SorryInfo
   axiomsOk : Bool
   disallowedAxioms : Array String
-  decls : Array String
+  decls : Array LeanDeclaration
   messages : Array MessageInfo
   deriving ToJson
 

@@ -45,8 +45,17 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
     pure ({ message := text, span := span } : ErrorInfo)
   )
 
-  let decls := steps.map (fun step => step.diff) |>.toList.flatten |>.map (fun decl => decl.name.toString) |>.toArray
-  let axioms := steps.map (fun step => step.diff.map (fun decl => getAxioms decl step.after)) |>.toList.flatten |>.toArray.flatten.sortDedup
+  let mut decls := #[]
+  let mut axioms := #[]
+  for step in steps do
+    for decl in step.diff do
+      let axs := getAxioms decl step.after
+      decls := decls.push ({ name := decl.name, type := toString decl.type, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
+
+      for ax in axs do
+        if ax ∉ axioms then
+          axioms := axioms.push ax
+
 
   let sorries : Array SorryInfo ← if `sorryAx ∈ axioms then do
     let out := (← steps.mapM (fun step => do
