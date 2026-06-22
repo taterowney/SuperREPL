@@ -71,7 +71,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
   let msgs ← steps.map (·.msgs.toArray) |>.flatten.mapM (fun m => Message.toMessageInfo m)
 
   return {
-    ok := sorries.isEmpty && errors.isEmpty,
+    ok := sorries.isEmpty && errors.isEmpty && axioms_ok,
     status := if !errors.isEmpty then "error"
       else if !sorries.isEmpty then "typechecksWithSorry"
       else if !axioms_ok then "disallowedAxioms"
