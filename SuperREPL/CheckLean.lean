@@ -5,6 +5,7 @@ public meta import SuperREPL.CheckingUtilities
 public meta import TrainingData.Utils.Dependencies
 public meta import TrainingData.Utils.Frontend
 public import TrainingData.Utils.Frontend
+public import TrainingData.Utils.ConstantInfo
 import Std.Data.Iterators
 
 public section
@@ -49,6 +50,8 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
   let mut axioms := #[]
   for step in steps do
     for decl in step.diff do
+      if decl.isInternal || !(decl.isTheorem || decl.isDef || decl.isAxiom || decl.isInductive || decl.isCtor) then continue
+
       let axs := getAxioms decl step.after
       decls := decls.push ({ name := decl.name, type := toString decl.type, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
 
