@@ -5,7 +5,7 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "a46197c85e9c6cd33abec10e686ed01140c3f395",
+   "rev": "db261fbd81395675e2b1606982d76c96803bb0a0",
    "name": "TrainingData",
    "manifestFile": "lake-manifest.json",
    "inputRev": "master",
