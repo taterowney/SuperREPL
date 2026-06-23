@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from time import time
 
 from .basic import Request
@@ -43,11 +44,11 @@ class Server:
 
     def __init__(self, num_processes: int, lean_modules: list[str],
                  *, window_size: float = 10.0, policy: RoutingPolicy | None = None,
-                 ready_timeout: float = 600.0):
-        self.processes: list[LeanInterface] = [
-            LeanInterface(lean_modules, id=i, ready_timeout=ready_timeout)
-            for i in range(num_processes)
-        ]
+                 ready_timeout: float = 600.0, startup_concurrency: int | None = None):
+        self.processes: list[LeanInterface] = self._spawn_pool(
+            num_processes, lean_modules,
+            ready_timeout=ready_timeout, startup_concurrency=startup_concurrency,
+        )
         self.policy = policy or AdaptivePolicy(num_processes)
         self.window_size = window_size
         self._window: deque[Request] = deque()        # rolling arrival window
@@ -58,6 +59,56 @@ class Server:
         self._http_thread: threading.Thread | None = None
         self._http_runner = None                      # aiohttp.web.AppRunner
         self._url: str | None = None
+
+    @staticmethod
+    def _spawn_pool(num_processes: int, lean_modules: list[str], *,
+                    ready_timeout: float, startup_concurrency: int | None) -> list[LeanInterface]:
+        """Build the Lean modules once, then bring up ``num_processes`` bridges
+        concurrently.
+
+        Each ``LeanInterface`` construction blocks for seconds (the bridge
+        spawns and imports before reporting its manifest), so spawning them in a
+        thread pool collapses an otherwise ``num_processes``-fold serial wait to
+        roughly one process's startup. The shared ``lake build`` is done once up
+        front (concurrent builds of the same targets race on ``.lake/build``);
+        the per-bridge constructions then only spawn read-only ``lake exe
+        bridge`` processes, which is safe in parallel.
+
+        ``startup_concurrency`` caps how many start at once (``None`` =
+        unbounded) to bound the peak import memory/CPU spike on a constrained
+        box. If any bridge fails to come up, the ones that did are closed before
+        re-raising so we don't leak live processes.
+        """
+        if num_processes <= 0:
+            return []
+
+        LeanInterface.build_modules(lean_modules)
+
+        max_workers = num_processes if startup_concurrency is None else max(1, startup_concurrency)
+        processes: list[LeanInterface | None] = [None] * num_processes
+        errors: list[BaseException] = []
+        # Resolve *every* future before reacting to a failure: the pool's
+        # __exit__ joins all spawns anyway, so a successful-but-late bridge must
+        # be captured (and closed below) rather than leaked.
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="lean-spawn") as pool:
+            futures = {
+                pool.submit(
+                    LeanInterface, lean_modules,
+                    id=i, ready_timeout=ready_timeout, build=False,
+                ): i
+                for i in range(num_processes)
+            }
+            for fut, i in futures.items():
+                try:
+                    processes[i] = fut.result()
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            for proc in processes:
+                if proc is not None:
+                    proc.close()
+            raise errors[0]
+        return [p for p in processes if p is not None]
 
     # ---- HTTP serving ---------------------------------------------------- #
     @property

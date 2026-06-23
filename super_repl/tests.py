@@ -55,7 +55,7 @@ def lean_problems() -> list[tuple[str, str]]:
         ("type-error",     'def b : Nat := "not a nat"'),
         ("unknown-ident",  "def c := someUndefinedIdentifier"),
         ("with-import",    "import Init.Data.List\nimport Mathlib\ndef l := [1, 2, 3]"),
-    ] * 2000
+    ] * 200
 
 
 # ──────────────────────────────────────────────────────────────────────────

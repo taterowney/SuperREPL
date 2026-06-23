@@ -83,6 +83,7 @@ import asyncio
 import json
 import logging
 import signal
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -232,6 +233,7 @@ class LeanInterface:
         id: int = 0,
         cwd: str | Path | None = None,
         ready_timeout: float = 600.0,
+        build: bool = True,
     ) -> None:
         """Spawn the bridge for ``lean_modules`` and wait until it is ready.
 
@@ -245,14 +247,18 @@ class LeanInterface:
                 repository root containing ``lakefile.toml``.
             ready_timeout: Seconds to wait for the bridge's manifest handshake.
                 The first run may compile Lean, so this is large.
+            build: When true (default) run ``lake build`` for the modules before
+                spawning the bridge. Set false when the caller has already built
+                them (e.g. a pool building once up front, then spawning several
+                bridges concurrently) — concurrent ``lake build`` of the same
+                targets races on the shared build tree, so it must be done once.
         """
         self.id = id
         self.cluster: int | None = None  # category pinned by the routing policy
-        # Always include the default-tools module(s), without duplicating any the
-        # caller already passed; dict.fromkeys preserves first-seen order.
-        self.lean_modules = list(dict.fromkeys([*_ALWAYS_MODULES, *lean_modules]))
+        self.lean_modules = self._effective_modules(lean_modules)
         self._cwd = str(cwd) if cwd is not None else str(_DEFAULT_CWD)
         self._ready_timeout = ready_timeout
+        self._build = build
 
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(
@@ -278,9 +284,39 @@ class LeanInterface:
 
     # ── Construction ─────────────────────────────────────────────
 
+    @staticmethod
+    def _effective_modules(lean_modules: list[str]) -> list[str]:
+        """The modules a bridge actually imports: the always-on default tools
+        (see :data:`_ALWAYS_MODULES`) prepended to the caller's list, with
+        duplicates dropped. ``dict.fromkeys`` preserves first-seen order."""
+        return list(dict.fromkeys([*_ALWAYS_MODULES, *lean_modules]))
+
+    @classmethod
+    def build_modules(cls, lean_modules: list[str], *, cwd: str | Path | None = None) -> None:
+        """Compile ``lean_modules`` (plus the always-on defaults) once, blocking.
+
+        Spawning several bridges concurrently must *not* each run ``lake build``
+        of the same targets — concurrent builds race on the shared ``.lake/build``
+        tree. A pool calls this once up front, then constructs its bridges with
+        ``build=False`` so they only spawn (read-only) ``lake exe bridge``
+        processes. Raises ``RuntimeError`` if the build fails or any module is
+        missing (lake returns nonzero and prints diagnostics)."""
+        modules = cls._effective_modules(lean_modules)
+        cwd_str = str(cwd) if cwd is not None else str(_DEFAULT_CWD)
+        proc = subprocess.run(
+            ["lake", "build", *modules], cwd=cwd_str,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"`lake build {' '.join(modules)}` failed "
+                f"(exit {proc.returncode}):\n{proc.stdout.decode(errors='replace')}"
+            )
+
     async def _async_setup(self) -> None:
         self._queue = asyncio.PriorityQueue()
-        await self._build_modules()
+        if self._build:
+            await self._build_modules()
         await self._spawn_proc()
         # Single consumer of the priority queue; nothing can enqueue until the
         # constructor returns, so starting it here (after the manifest) is safe.
