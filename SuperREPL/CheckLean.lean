@@ -69,7 +69,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
   else
     pure #[]
 
-  let axioms_ok := axioms.all (· ∈ allowedAxioms)
+  let axioms_ok := axioms.all (· ∈ allowedAxioms ++ [sorryAxiom])
 
   let msgs ← steps.map (·.msgs.toArray) |>.flatten.mapM (fun m => Message.toMessageInfo m)
 
@@ -82,7 +82,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
     errors := errors,
     sorries := sorries,
     axiomsOk := axioms_ok,
-    disallowedAxioms := axioms.filter (· ∉ allowedAxioms) |>.map toString,
+    additionalAxioms := axioms.filter (· ∉ allowedAxioms ++ [sorryAxiom]) |>.map toString,
     decls := decls,
     messages := msgs
   }

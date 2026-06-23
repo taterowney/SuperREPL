@@ -142,7 +142,7 @@ structure FullCheckResult where
   errors : Array ErrorInfo
   sorries : Array SorryInfo
   axiomsOk : Bool
-  disallowedAxioms : Array String
+  additionalAxioms : Array String
   decls : Array LeanDeclaration
   messages : Array MessageInfo
   deriving ToJson
