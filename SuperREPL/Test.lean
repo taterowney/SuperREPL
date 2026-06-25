@@ -4,8 +4,8 @@ import Lean
 open Lean Elab Command
 
 -- #eval do
---   let res ← checkLean "module \n public import Mathlib\npublic section \n theorem putnam_1962_b1 (p : ℕ → ℝ → ℝ) (x y : ℝ) (n : ℕ) (h0 : p 0 = fun x : ℝ => 1) (hp : ∀ n > 0, p n = fun x : ℝ => ∏ i ∈ Finset.range n, (x - i)) : p n (x+y) = ∑ k ∈ Finset.range (n+1), Nat.choose n k * (p k x) * (p (n - k) y) := sorry"
---   IO.println s!"{toJson res.decls}"
+--   let res ← checkLean "module \n import Mathlib\npublic section \n theorem putnam_1962_b1 (p : ℕ → ℝ → ℝ) (x y : ℝ) (n : ℕ) (h0 : p 0 = fun x : ℝ => 1) (hp : ∀ n > 0, p n = fun x : ℝ => ∏ i ∈ Finset.range n, (x - i)) : p n (x+y) = ∑ k ∈ Finset.range (n+1), Nat.choose n k * (p k x) * (p (n - k) y) := sorry"
+--   IO.println s!"{toJson res}"
 
 
 -- namespace SuperREPLTests

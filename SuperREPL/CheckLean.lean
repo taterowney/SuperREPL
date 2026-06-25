@@ -49,9 +49,7 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
   let mut decls := #[]
   let mut axioms := #[]
   for step in steps do
-    println! "Step: {step.src.toString}"
     for decl in step.diff do
-      println! "  Decl: {decl.name} : {decl.type}"
       let axs := getAxioms decl step.after
 
       for ax in axs do
