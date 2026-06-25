@@ -49,15 +49,19 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
   let mut decls := #[]
   let mut axioms := #[]
   for step in steps do
+    println! "Step: {step.src.toString}"
     for decl in step.diff do
-      if decl.isInternal || !(decl.isTheorem || decl.isDef || decl.isAxiom || decl.isInductive || decl.isCtor) then continue
-
+      println! "  Decl: {decl.name} : {decl.type}"
       let axs := getAxioms decl step.after
-      decls := decls.push ({ name := decl.name, type := toString decl.type, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
 
       for ax in axs do
         if ax ∉ axioms then
           axioms := axioms.push ax
+
+      if decl.isInternal || !(decl.isTheorem || decl.isDef || decl.isAxiom || decl.isInductive || decl.isCtor) then continue
+      decls := decls.push ({ name := decl.name, type := toString decl.type, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
+
+
 
 
   let sorries : Array SorryInfo ← if `sorryAx ∈ axioms then do
@@ -180,31 +184,3 @@ Implements significant caching logic to speed up repeated checks of similar code
 unsafe def checkLean (leanCode : String) : CommandElabM FullCheckResult := do
   let steps ← compilationStepsCached leanCode
   toResult steps
-
-
-
--- unsafe def solveWithAutomation (imports : Array Name) (codeWithoutImportStatements : String) : CommandElabM FullCheckResult := do
---   let importArr := #[{module := `Init}] ++ (imports.map (fun m => { module := m }))
---   let (_, result) ← withFreshCommandElabM importArr (source := codeWithoutImportStatements) do
---     let parsedRes ← (do
---       try
---         let cmds ← parseCommands codeWithoutImportStatements (← getEnv)
---         pure (Except.ok cmds.toArray)
---       catch e =>
---         pure (Except.error (← e.toMessageData.toString)))
-
---     match parsedRes with
---     | .error errStr =>
---         pure {
---           ok := false, status := "error",
---           errors := #[{ message := errStr, span := none }],
---           sorries := #[], axiomsOk := false, disallowedAxioms := #[],
---           problemComplete := false, decls := #[]
---         }
---     | .ok cmds =>
---         let tac ← `(by auto_solve)
---         let cmds ← cmds.mapM (fun (name, decl) =>do
---           let out ← replaceValueIfSorry decl tac
---           return (name, out))
---         checkCommandsFull (cmds.map Prod.snd) (cmds.map Prod.fst) none
---   return result
