@@ -137,6 +137,17 @@ unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.C
 
   if let some overlap := possibleSourcePrefix then
     let mut processedPos := 0
+    -- Only cache up to the last scope-balanced boundary. `processInput'` always
+    -- starts with a fresh `Command.State` (scope stack reset to root), so if the
+    -- split point falls inside an open `namespace`/`section`, a subsequent `end`
+    -- in the resumed call will fail with "Invalid `end`: There is no current scope
+    -- to end". We track scope depth via `step.stx.getKind` (robust against
+    -- modifiers like `public`/`noncomputable` because they share the same parser
+    -- rule kind) and only advance the cache boundary when depth returns to 0.
+    let mut lastBalancedPos := processedPos
+    let mut lastBalancedEnv := env
+    let mut lastBalancedSteps := steps
+    let mut scopeDepth : Int := 0
     for step in IO.processInput' overlap (some env) do
       if step.hasErrors then
         break
@@ -144,6 +155,21 @@ unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.C
       steps := steps.push step
       processedPos := step.src.stopPos
       env := step.after
+
+      let k := step.stx.getKind
+      if k == `Lean.Parser.Command.«namespace» || k == `Lean.Parser.Command.«section» then
+        scopeDepth := scopeDepth + 1
+      else if k == `Lean.Parser.Command.«end» then
+        scopeDepth := scopeDepth - 1
+
+      if scopeDepth == 0 then
+        lastBalancedPos := processedPos
+        lastBalancedEnv := env
+        lastBalancedSteps := steps
+
+    processedPos := lastBalancedPos
+    env := lastBalancedEnv
+    steps := lastBalancedSteps
 
     if h : String.Pos.Raw.IsValid source processedPos then
       let pos : String.Pos source := ⟨processedPos, h⟩
