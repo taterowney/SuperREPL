@@ -57,7 +57,9 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
           axioms := axioms.push ax
 
       if decl.isInternal || !(decl.isTheorem || decl.isDef || decl.isAxiom || decl.isInductive || decl.isCtor) then continue
-      decls := decls.push ({ name := decl.name, type := toString decl.type, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
+
+      let pretty := (← liftTermElabM <| PrettyPrinter.ppExpr decl.type).pretty'
+      decls := decls.push ({ name := decl.name, type := pretty, src := step.src.toString, has_sorry := axs.contains sorryAxiom } : LeanDeclaration)
 
 
 

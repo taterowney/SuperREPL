@@ -24,7 +24,7 @@ open Lean Elab Command
 
 -- namespace step0
 
--- theorem step_decl : 3 * 3 = 9 := by rfl
+-- theorem step_decl : 3 * 3 = 9 := by sorry
 
 -- end step0"
 --   logInfo m!"{toJson <| ← checkLean code}"
