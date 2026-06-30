@@ -134,8 +134,6 @@ unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.C
         -- maybe use the cached environment
 
         for (step, cmdState) in cachedSteps do -- loop through each cached compilationStep and confirm that it fully matches with the current parsed source code. If so, use the cached one instead of elaborating again
-          println! "Checking cached step: {step.stx}"
-
           let s := (← get).commandState
           let before := s.env
           updateCmdPos
@@ -152,7 +150,6 @@ unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.C
             && src == step.src -- ...and same source code (again counting whitespace so infotrees are valid)
             do break
 
-          println! "Reusing cached step: {step.stx}"
           out := out.push (step, cmdState)
           lastPos := ps.pos
           modify fun st => { st with commandState := cmdState }
