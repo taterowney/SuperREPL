@@ -8,9 +8,22 @@ public import TrainingData.Utils.Frontend
 public import TrainingData.Utils.ConstantInfo
 import Std.Data.Iterators
 
+/-! Exposes a `checkLean` function that can be called from Python to check a string
+of Lean code, returning a JSON-serializable object with information about errors, sorries, axioms, and declarations.
+
+checkLean uses all the environment caching logic defined elsewhere, plus some extra
+magic to save time by not re-elaborating commands that have already been elaborated
+previously. We still parse everything for robustness since matching on the raw source
+code doens't deal with jankiness like `"def x := 1"` -> `"def x := 1\n + 1"`; empirically
+parsing is far faster than elaboration (since most big bottlenecks come from typeclass
+inference, unification, etc.), so this saves a lot of time when checking a sequence of
+similar e.g. machine-generated proofs
+-/
+
+
 public section
 
-open Lean Meta Elab Command
+open Lean Meta Elab Expr Term Command Parser Lean.Elab.Frontend IO
 
 
 def String.leftOverlap (s1 s2 : String) : String :=
@@ -94,109 +107,90 @@ def toResult (steps : Array IO.CompilationStep) : CommandElabM FullCheckResult :
 
 
 
-initialize prefixEnvironmentCache : IO.Ref (Option (Array Import × String × Environment × Array IO.CompilationStep)) ← IO.mkRef none
-
+initialize prefixEnvironmentCache : IO.Ref (Option (Array Import × String.Pos.Raw × String × Array (CompilationStep × Command.State))) ← IO.mkRef none
 
 
 
 unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.CompilationStep) := do
   enableInitializersExecution
 
-  let imports := (← parseImports'' leanCode "<input>").imports
+  let parsed ← parseImports'' leanCode "<input>"
+  let imports := parsed.imports
+  let headerPos := parsed.pos
+
   let mut source := removeHeader leanCode
 
-  let mut steps := #[]
 
-  let mut possibleSourcePrefix : Option String := none -- The maximum possible overlap between the current and previously processed source code. We set this if we actually want to recompute the environment that will be cached for next time
-  let mut actualSourcePrefix : Option String := none -- The overlap between the current and previously processed source code that we actually end up processing (which may be less than the above if half a command gets cut off or something)
+  let env ← freshEnvironment imports
 
-  let env ← if let some (cachedImports, cachedSource, cachedEnv, cachedSteps) ← prefixEnvironmentCache.get then
-    if cachedImports == imports then
-      -- maybe used cached environment
+  -- Step through each command, parsing them in the appropriate environment but using the already-elaborated cached steps if it has been elaborated before. Keeps track of `Command.State`s so namespaces, etc. can be remembered
+  let aux : FrontendM (Array (CompilationStep × Command.State)) := do
+    let mut out := #[]
+    let mut lastPos := (← get).parserState.pos
 
-      if source.isBoundaryPrefix cachedSource then
-        -- can reuse cached environment (cached prefix ends on a command boundary)
-        actualSourcePrefix := some cachedSource
-        steps := cachedSteps
-        pure cachedEnv
-      else
-        -- Trim any partially-overlapping final token so the incremental pass below
-        -- never elaborates a command that was cut mid-token.
-        let overlap := (source.leftOverlap cachedSource).dropPartialToken
-        -- enough overlap to potentially reuse cached environment next round
-        possibleSourcePrefix := some overlap
+    if let some (cachedImports, cachedHeaderPos, cachedSource, cachedSteps) ← prefixEnvironmentCache.get then
+      if cachedImports == imports -- If the imports are the same...
+        && cachedHeaderPos == headerPos then -- ...and the headers of both are the same size (so infotrees aren't out of date)
+        -- maybe use the cached environment
 
-        freshEnvironment imports
-    else
-      -- different imports, can't reuse cached environment
-      possibleSourcePrefix := some source
-      freshEnvironment imports
-  else -- no cached environment, need to create one
-    possibleSourcePrefix := some source
-    freshEnvironment imports
+        for (step, cmdState) in cachedSteps do -- loop through each cached compilationStep and confirm that it fully matches with the current parsed source code. If so, use the cached one instead of elaborating again
+          println! "Checking cached step: {step.stx}"
 
-  let mut env := env
+          let s := (← get).commandState
+          let before := s.env
+          updateCmdPos
+          let ictx ← getInputContext
+          let pstate ← getParserState
+          let scope := s.scopes.head!
+          let pmctx := { env := s.env, options := scope.opts, currNamespace := scope.currNamespace, openDecls := scope.openDecls }
+          let (cmd, ps, parserMessages) := profileit "parsing" scope.opts fun _ =>
+            Parser.parseCommand ictx pmctx pstate s.messages
 
-  if let some overlap := possibleSourcePrefix then
-    let mut processedPos := 0
-    -- Only cache up to the last scope-balanced boundary. `processInput'` always
-    -- starts with a fresh `Command.State` (scope stack reset to root), so if the
-    -- split point falls inside an open `namespace`/`section`, a subsequent `end`
-    -- in the resumed call will fail with "Invalid `end`: There is no current scope
-    -- to end". We track scope depth via `step.stx.getKind` (robust against
-    -- modifiers like `public`/`noncomputable` because they share the same parser
-    -- rule kind) and only advance the cache boundary when depth returns to 0.
-    let mut lastBalancedPos := processedPos
-    let mut lastBalancedEnv := env
-    let mut lastBalancedSteps := steps
-    let mut scopeDepth : Int := 0
-    for step in IO.processInput' overlap (some env) do
-      if step.hasErrors then
-        break
+          let src := Substring.Raw.mk ictx.inputString lastPos ps.pos
 
-      steps := steps.push step
-      processedPos := step.src.stopPos
-      env := step.after
+          unless cmd == step.stx -- Same syntax...
+            && src == step.src -- ...and same source code (again counting whitespace so infotrees are valid)
+            do break
 
-      let k := step.stx.getKind
-      if k == `Lean.Parser.Command.«namespace» || k == `Lean.Parser.Command.«section» then
-        scopeDepth := scopeDepth + 1
-      else if k == `Lean.Parser.Command.«end» then
-        scopeDepth := scopeDepth - 1
+          println! "Reusing cached step: {step.stx}"
+          out := out.push (step, cmdState)
+          lastPos := ps.pos
+          modify fun st => { st with commandState := cmdState }
+          modify fun st => { st with commands := st.commands.push cmd }
+          setParserState ps
+          setMessages parserMessages
+          -- `parseCommand` appends its messages to the ones passed in (`s.messages`); the new tail is this
+          -- command's parse-stage messages, which `elabCommandTopLevel`'s reset would otherwise discard.
+          let parseMsgs := parserMessages.toList.drop s.messages.toList.length
 
-      if scopeDepth == 0 then
-        lastBalancedPos := processedPos
-        lastBalancedEnv := env
-        lastBalancedSteps := steps
-
-    processedPos := lastBalancedPos
-    env := lastBalancedEnv
-    steps := lastBalancedSteps
-
-    if h : String.Pos.Raw.IsValid source processedPos then
-      let pos : String.Pos source := ⟨processedPos, h⟩
-      actualSourcePrefix := some (source.sliceTo pos |>.toString)
-    else throwError "Assertion failed: processInput' somehow gave a position that isn't valid in the original source string"
+          if Parser.isTerminalCommand cmd then
+            return out
 
 
-  if let some actualPrefix := actualSourcePrefix then
-    if !actualPrefix.isEmpty then
 
-      prefixEnvironmentCache.set (some (imports, actualPrefix, env, steps))
-      source := source.drop actualPrefix.length |>.toString
 
-      for step in IO.processInput' source (some env) do
-        steps := steps.push step
+    while true do -- Process the remaining steps until complete
+      let (cmd, done) ← CompilationStep.one
+      out := out.push (cmd, (← get).commandState)
+      if done then break
 
-      return steps
+    return out
 
-    else -- If there is no valid overlap, we keep the entire source cached instead of caching an empty string so it doesn't get stuck
-      for step in IO.processInput' source (some env) do
-        steps := steps.push step
-      prefixEnvironmentCache.set (some (imports, source, env, steps))
-      return steps
-  else
-    throwError "Assertion failed: actualSourcePrefix was unset"
+
+
+
+  let ictx := mkInputContext leanCode "<input>"
+  let (_, parserState, _) ← Parser.parseHeader ictx
+  let opts := {}
+  let commandState := { Command.mkState env {} opts with infoState.enabled := true }
+
+  let (stepsWithStates, s) ← aux.run { inputCtx := ictx } |>.run { commandState, parserState, cmdPos := parserState.pos }
+
+  prefixEnvironmentCache.set (some (imports, headerPos, source, stepsWithStates)) -- Store all of this round's steps (still ok if the next round only uses some of them since `aux` determines exactly how many can be used)
+
+  return stepsWithStates.map (·.fst)
+
+
 
 
 

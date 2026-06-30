@@ -14,7 +14,13 @@ open Lean Elab Command
 
 -- theorem step_decl : 3 * 3 = 9 := by sorry
 
--- end step0"
+-- end step0
+
+-- namespace step1
+-- #check step0.step_decl
+
+-- end step1
+-- "
 --   logInfo m!"{toJson <| ← checkLean code}"
 
 --   let code := "module
@@ -26,7 +32,20 @@ open Lean Elab Command
 
 -- theorem step_decl : 3 * 3 = 9 := by sorry
 
--- end step0"
+-- end step0
+
+-- namespace step1
+-- #check step0.step_decl
+
+-- end step1
+
+
+-- namespace step2
+
+-- theorem step_decl : 3 * 3 = 9 := by sorry
+
+-- end step2
+-- "
 --   logInfo m!"{toJson <| ← checkLean code}"
 
 
