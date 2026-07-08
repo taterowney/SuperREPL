@@ -20,11 +20,15 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from time import time
+from typing import TYPE_CHECKING
 
 from .basic import Request
 from .lean_interface import LeanInterface, MethodResult
 from .policy import AdaptivePolicy, RoutingPolicy
 from .service import DEFAULT_HOST, DEFAULT_PORT, make_app
+
+if TYPE_CHECKING:
+    from .memory import MemoryManager
 
 
 # --------------------------------------------------------------------------- #
@@ -44,7 +48,9 @@ class Server:
 
     def __init__(self, num_processes: int, lean_modules: list[str],
                  *, window_size: float = 10.0, policy: RoutingPolicy | None = None,
-                 ready_timeout: float = 600.0, startup_concurrency: int | None = None):
+                 ready_timeout: float = 600.0, startup_concurrency: int | None = None,
+                 memory_budget: int | None = None,
+                 memory_options: dict | None = None):
         self.processes: list[LeanInterface] = self._spawn_pool(
             num_processes, lean_modules,
             ready_timeout=ready_timeout, startup_concurrency=startup_concurrency,
@@ -54,11 +60,40 @@ class Server:
         self._window: deque[Request] = deque()        # rolling arrival window
         self.assignment: dict[int, list[int]] = {}    # category -> [process ids]
 
+        # Optional RAM-budget guard: verify the freshly-spawned pool fits with
+        # headroom, then monitor growth and restart the hungriest bridge when the
+        # aggregate nears the budget. Set up before serving so a too-small budget
+        # fails fast (tearing the pool down) rather than mid-traffic.
+        self.memory = self._init_memory(memory_budget, memory_options)
+
         # HTTP serving state (see `serve` / `url` / `stop_serving`).
         self._http_loop: asyncio.AbstractEventLoop | None = None
         self._http_thread: threading.Thread | None = None
         self._http_runner = None                      # aiohttp.web.AppRunner
         self._url: str | None = None
+
+    def _init_memory(self, memory_budget: int | None,
+                     memory_options: dict | None) -> "MemoryManager | None":
+        """Build and arm the memory-budget guard, or return ``None`` when no
+        budget is requested. On a failed startup fit the already-spawned pool is
+        torn down before the error propagates so no live processes leak."""
+        if memory_budget is None:
+            return None
+        from .memory import MemoryManager
+
+        manager = MemoryManager(self.processes, memory_budget, **(memory_options or {}))
+        try:
+            manager.check_startup()
+        except Exception:
+            for proc in self.processes:
+                proc.close()
+            raise
+        manager.start()
+        return manager
+
+    def memory_snapshot(self) -> dict | None:
+        """Current memory-vs-budget view, or ``None`` if no budget is set."""
+        return self.memory.snapshot() if self.memory is not None else None
 
     @staticmethod
     def _spawn_pool(num_processes: int, lean_modules: list[str], *,
@@ -247,6 +282,8 @@ class Server:
     def close(self) -> None:
         """Stop serving (if active) and tear down every Lean bridge in the pool."""
         self.stop_serving()
+        if self.memory is not None:
+            self.memory.stop()
         for proc in self.processes:
             proc.close()
 

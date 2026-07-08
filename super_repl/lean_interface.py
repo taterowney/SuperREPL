@@ -97,6 +97,34 @@ from .basic import Request
 logger = logging.getLogger(__name__)
 
 
+def _tree_rss_bytes(pid: int) -> int | None:
+    """Total resident memory (bytes) of process ``pid`` plus all its descendants,
+    or ``None`` if it can't be read.
+
+    A bridge's ``self._proc`` is the ``lake`` launcher; the heavy Lean work runs
+    in its ``lean`` children (``lake -> lean -> lean``), so the meaningful figure
+    is the whole tree, not just the root. ``psutil`` is imported lazily so
+    importing this module stays cheap and psutil stays an optional dependency
+    (returns ``None`` when it is unavailable). Safe to call from any thread."""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        root = psutil.Process(pid)
+        procs = [root, *root.children(recursive=True)]
+    except psutil.Error:
+        return None
+    total = 0
+    for p in procs:
+        try:
+            total += p.memory_info().rss
+        except psutil.Error:
+            # A child may exit mid-walk; skip it rather than lose the whole read.
+            continue
+    return total
+
+
 class _BridgeDied(Exception):
     """Raised internally when the bridge's stdio pipe closes mid-exchange (the
     process exited/crashed). Signals the worker to restart the process."""
@@ -149,6 +177,21 @@ class _QueuedCall:
     arguments: dict[str, Any] | None
     query_imports: bool
     timeout: float | None
+
+
+class _RestartMarker:
+    """Queue payload asking the worker to restart the bridge *between* jobs.
+
+    Enqueued (like a request) as the payload of a ``(priority, seq, marker)``
+    tuple. Because the worker consumes one item at a time, the marker is only
+    reached once the current in-flight request has finished — so no request is
+    interrupted — and anything still queued behind it is served by the fresh
+    process. ``future`` is resolved once the swap completes (or fails)."""
+
+    __slots__ = ("future",)
+
+    def __init__(self, future: "asyncio.Future[bool]") -> None:
+        self.future = future
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -652,6 +695,9 @@ class LeanInterface:
             try:
                 if job is None:
                     return
+                if isinstance(job, _RestartMarker):
+                    await self._graceful_restart(job)
+                    continue
                 if job.future.done():  # caller already gave up; skip the work
                     continue
                 try:
@@ -769,6 +815,54 @@ class LeanInterface:
             self._stderr_task = None
         await self._spawn_proc()
         logger.info("Lean bridge (id=%s) restarted (restart #%d)", self.id, self._restarts)
+
+    async def _graceful_restart(self, marker: _RestartMarker) -> None:
+        """Handle a queued :class:`_RestartMarker`: swap in a fresh process and
+        resolve the marker's future. Runs on the worker between jobs, so the
+        in-flight request (if any) has already completed and the rest of the
+        queue is untouched — it simply gets served by the new process."""
+        try:
+            await self._restart()
+        except Exception as exc:
+            logger.error("Lean bridge (id=%s) graceful restart failed: %s", self.id, exc)
+            if not marker.future.done():
+                marker.future.set_exception(exc)
+            return
+        if not marker.future.done():
+            marker.future.set_result(True)
+
+    async def _async_request_restart(self) -> None:
+        """Enqueue a restart marker (on the loop, so the queue stays single-owner)
+        and await its completion. Runs at top priority so memory relief happens as
+        soon as the current request finishes, ahead of the queued backlog (which
+        the fresh, low-memory process then serves)."""
+        if self._closed or self._queue is None:
+            return
+        future: asyncio.Future[bool] = self._loop.create_future()
+        self._seq += 1
+        self._queue.put_nowait((0, self._seq, _RestartMarker(future)))
+        await future
+
+    def restart(self) -> None:
+        """Gracefully restart this bridge, preserving queued requests.
+
+        The swap is performed by the worker only after the current in-flight
+        request (if any) finishes, so no request is interrupted; requests still
+        queued are served by the replacement process. Blocks until the fresh
+        process is ready. Intended for external callers (e.g. a memory-budget
+        monitor) that want to reclaim a process's accumulated cache memory."""
+        if self._closed:
+            return
+        self._dispatch(self._async_request_restart())
+
+    def memory_rss(self) -> int | None:
+        """Resident memory (bytes) of this bridge's whole process tree (the
+        ``lake`` launcher plus its ``lean`` children), or ``None`` if it is not
+        currently running or can't be read. Safe to call from any thread."""
+        proc = self._proc
+        if proc is None:
+            return None
+        return _tree_rss_bytes(proc.pid)
 
     async def _kill_proc(self) -> None:
         """Ensure the current process is dead and reaped."""

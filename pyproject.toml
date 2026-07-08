@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",   # Client side
-    "aiohttp>=3.9"
+    "aiohttp>=3.9",
+    "psutil>=7.2.2"
 ]
 
 [project.scripts]

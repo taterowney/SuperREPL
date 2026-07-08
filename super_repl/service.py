@@ -90,7 +90,11 @@ def make_app(server: "Server"):
 
     @routes.get("/health")
     async def _health(request: "web.Request") -> "web.Response":
-        return web.json_response({"status": "ok", "processes": len(server.processes)})
+        body: dict[str, Any] = {"status": "ok", "processes": len(server.processes)}
+        memory = server.memory_snapshot()
+        if memory is not None:
+            body["memory"] = memory
+        return web.json_response(body)
 
     @routes.get("/methods")
     async def _methods(request: "web.Request") -> "web.Response":
@@ -262,12 +266,19 @@ def _main(argv: list[str] | None = None) -> None:
                         help="comma-separated Lean modules to import into each bridge")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument("--memory-budget-gb", type=float, default=None,
+                        help="aggregate RAM budget (GiB) for the Lean pool; the "
+                             "hungriest bridge is restarted as the total nears it")
     args = parser.parse_args(argv)
 
     from .main import Server  # local import: keeps the Client free of server deps
 
     modules = [m.strip() for m in args.modules.split(",") if m.strip()]
-    server = Server(args.processes, modules)
+    memory_budget = (
+        int(args.memory_budget_gb * 1024 ** 3)
+        if args.memory_budget_gb is not None else None
+    )
+    server = Server(args.processes, modules, memory_budget=memory_budget)
     serve(server, host=args.host, port=args.port)
 
 

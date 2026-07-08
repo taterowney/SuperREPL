@@ -192,6 +192,7 @@ def _configure_logging(debug: bool) -> None:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Exercise the SuperREPL stack.")
     parser.add_argument("--processes", type=int, default=2, help="bridges in the pool")
+    parser.add_argument("--budget", type=int, default=0, help="max memory per bridge (GiB, 0=unlimited)")
     parser.add_argument("--crash", action="store_true",
                         help="also run the bridge crash-recovery test")
     parser.add_argument("--debug", action="store_true",
@@ -201,7 +202,7 @@ def main(argv: list[str] | None = None) -> None:
     _configure_logging(args.debug or _env_debug())
 
     total_start = time.perf_counter()
-    server = Server(num_processes=args.processes, lean_modules=[CHECK_MODULE])
+    server = Server(num_processes=args.processes, lean_modules=[CHECK_MODULE], memory_budget=args.budget * 1024**3)
     try:
         asyncio.run(check_problems(server))
         if args.crash:
