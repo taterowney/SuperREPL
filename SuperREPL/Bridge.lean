@@ -38,26 +38,35 @@ def emit (j : Json) : IO Unit := do
   out.flush
   err.flush
 
-/-- Payload when requested command succeeds -/
-def successResult (res : Json) : IO Json := do
+/-- Payload when requested command succeeds. `id` echoes the request's `id`
+field (or `null` if it had none) so the client can correlate this response
+with the request that produced it. -/
+def successResult (id : Json) (res : Json) : IO Json := do
   let (time, misses) := (← popLastImportStats).getD (0, 0)
-  return Json.mkObj [("result", "success"), ("value", res), ("cachedModules", toJson <| ← getCachedModules), ("importsTimeMs", toJson time), ("importCacheMisses", toJson misses)]
+  return Json.mkObj [("id", id), ("result", "success"), ("value", res), ("cachedModules", toJson <| ← getCachedModules), ("importsTimeMs", toJson time), ("importCacheMisses", toJson misses)]
 
-/-- Payload when requested command fails -/
-def errorResult (msg : String) : IO Json := do
+/-- Payload when requested command fails. `id` echoes the request's `id` field
+(see `successResult`). -/
+def errorResult (id : Json) (msg : String) : IO Json := do
   let (time, misses) := (← popLastImportStats).getD (0, 0)
-  return Json.mkObj [("result", "error"), ("value", msg), ("cachedModules", toJson <| ← getCachedModules), ("importsTimeMs", toJson time), ("importCacheMisses", toJson misses)]
+  return Json.mkObj [("id", id), ("result", "error"), ("value", msg), ("cachedModules", toJson <| ← getCachedModules), ("importsTimeMs", toJson time), ("importCacheMisses", toJson misses)]
 
 
 unsafe def handle (req : String) : CommandElabM Json := do
+  let cmdJson? := Json.parse req
+  -- Echo the request's `id` back on every response (including parse/validation
+  -- failures) so the client can discard stale replies rather than mistake them
+  -- for a later request's result.
+  let id : Json := match cmdJson? with
+    | .ok cmdJson => (cmdJson.getObjVal? "id" |>.toOption).getD Json.null
+    | .error _ => Json.null
   try
-    let cmdJson? := Json.parse req
     match cmdJson? with
-    | .error e => errorResult s!"Invalid JSON: {e}"
+    | .error e => errorResult id s!"Invalid JSON: {e}"
     | .ok cmdJson =>
-      let some methodJson := cmdJson.getObjVal? "method" |>.toOption | errorResult s!"Malformed payload: missing \"method\" field"
-      let some method := methodJson.getStr? |>.toOption | errorResult s!"Malformed payload: \"method\" field must be string"
-      let some argsJson := cmdJson.getObjVal? "args" |>.toOption | errorResult s!"Malformed payload: missing \"args\" field"
+      let some methodJson := cmdJson.getObjVal? "method" |>.toOption | errorResult id s!"Malformed payload: missing \"method\" field"
+      let some method := methodJson.getStr? |>.toOption | errorResult id s!"Malformed payload: \"method\" field must be string"
+      let some argsJson := cmdJson.getObjVal? "args" |>.toOption | errorResult id s!"Malformed payload: missing \"args\" field"
 
       let info ← liftCoreM <| findExposedMethod! method.toName
 
@@ -65,16 +74,16 @@ unsafe def handle (req : String) : CommandElabM Json := do
         match ← liftTermElabM <| info.getImportsFunction with
         | some importsFn =>
           let res ← importsFn argsJson
-          successResult res
-        | none => errorResult s!"Method {method} does not have a registered function to query imports."
+          successResult id res
+        | none => errorResult id s!"Method {method} does not have a registered function to query imports."
 
       else -- Assume it's just a normal call to the method
         let fn ← liftTermElabM <| info.getFunction
         let res ← fn argsJson
-        successResult res
+        successResult id res
 
   catch e =>
-    errorResult s!"{← e.toMessageData.format}"
+    errorResult id s!"{← e.toMessageData.format}"
 
 
 def emitReady : CoreM Unit := do

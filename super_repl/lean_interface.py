@@ -30,18 +30,21 @@ line:
     the default :meth:`LeanInterface.get_methods` listing but still callable.
 
   * To invoke a method, write a JSON request terminated by a blank line.
-    ``args`` is a JSON **object keyed by argument name**::
+    ``args`` is a JSON **object keyed by argument name**. An ``id`` correlates
+    the request with its response (echoed back verbatim) so late replies from a
+    timed-out request can't be mistaken for a later request's result::
 
-        {"method": "<method>", "args": {"<arg>": <json-value>, ...}}
+        {"id": <int>, "method": "<method>", "args": {"<arg>": <json-value>, ...}}
 
     Add ``"queryImports": true`` to instead run the method's imports function
     (only meaningful when ``uses_imports`` is true), returning the modules it
     needs rather than its result.
 
   * Each response is a single JSON object on one line, followed by a blank
-    line. Alongside the result it reports the process's import state::
+    line. It echoes the request's ``id`` and reports the process's import
+    state alongside the result::
 
-        {"result": "success", "value": <json-value>,
+        {"id": <int>, "result": "success", "value": <json-value>,
          "cachedModules": ["<module>", ...],   # modules now held by the process
          "importsTimeMs": <number>,            # ms spent importing this request
          "importCacheMisses": <int>}           # modules that missed the cache
@@ -313,6 +316,7 @@ class LeanInterface:
         self._queue: "asyncio.PriorityQueue[tuple[int, int, _QueuedCall | None]] | None" = None
         self._worker_task: asyncio.Task | None = None
         self._seq = 0  # unique tiebreaker so equal-priority requests stay FIFO
+        self._req_id = 0  # monotonic id stamped on each bridge request/response
         self._stderr_task: asyncio.Task | None = None
         self._method_defs: list[MethodDef] = []
         self._method_map: dict[str, MethodDef] = {}
@@ -469,6 +473,48 @@ class LeanInterface:
             line = raw.decode(errors="replace").strip()
             if line:
                 return line
+
+    async def _read_response(self, req_id: int, timeout: float | None) -> dict[str, Any]:
+        """Read the bridge's response for request ``req_id``, discarding stale
+        replies that belong to earlier requests.
+
+        The bridge echoes each request's ``id`` in its response. A request that
+        times out is not cancelled bridge-side — the bridge keeps working on it
+        and eventually emits its reply, which then sits in the pipe ahead of the
+        next request's reply. Matching on ``id`` lets us skip those late replies
+        instead of mistaking one for this request's result (which used to mix up
+        responses after any timeout). ``timeout`` bounds the whole wait, not each
+        individual read. Raises :class:`_BridgeDied` on EOF (via
+        :meth:`_read_line`)."""
+        deadline = None if timeout is None else time.perf_counter() + timeout
+        while True:
+            if deadline is None:
+                line = await self._read_line()
+            else:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                line = await asyncio.wait_for(self._read_line(), remaining)
+            try:
+                resp = json.loads(line)
+            except json.JSONDecodeError:
+                # The bridge always emits valid JSON per line, so an unparseable
+                # line is corruption we can't correlate; drop it and keep waiting
+                # for our reply rather than mis-attributing it.
+                logger.warning("Discarding unparseable bridge line: %r", line)
+                continue
+            if not isinstance(resp, dict):
+                logger.warning("Discarding non-object bridge response: %r", line)
+                continue
+            # A missing ``id`` means a bridge that predates id-echoing; accept it
+            # rather than loop forever waiting for a match.
+            resp_id = resp.get("id", req_id)
+            if resp_id == req_id:
+                return resp
+            logger.warning(
+                "Discarding stale Lean response (id=%r) while awaiting id=%r",
+                resp_id, req_id,
+            )
 
     async def _read_manifest(self) -> list[dict[str, Any]]:
         line = await self._read_line()
@@ -895,7 +941,14 @@ class LeanInterface:
             name=name, description="", input_schema=dict(OPEN_SCHEMA)
         )
 
+        # Stamp a unique id on the request; the bridge echoes it back so we can
+        # match the reply to this request and skip stale ones (see
+        # `_read_response`). Safe to bump here: `_execute_call` only runs on the
+        # single worker, so ids are handed out sequentially.
+        self._req_id += 1
+        req_id = self._req_id
         payload: dict[str, Any] = {
+            "id": req_id,
             "method": name,
             "args": arguments if arguments is not None else {},
         }
@@ -914,16 +967,12 @@ class LeanInterface:
         try:
             self._proc.stdin.write(request)
             await self._proc.stdin.drain()
-            read = self._read_line()
-            line = (
-                await asyncio.wait_for(read, timeout)
-                if timeout is not None
-                else await read
-            )
+            resp = await self._read_response(req_id, timeout)
         except asyncio.TimeoutError:
             # A timeout is not a crash — the process is presumed alive (the call
             # may still be running), so we surface an error result rather than
-            # restarting. The stream may now be desynced for the next call.
+            # restarting. Its late reply will be discarded by `_read_response`
+            # on the next call, matched out by its (now stale) id.
             logger.warning("Lean method %r timed out after %.1fs", name, timeout or 0.0)
             return MethodResult(
                 method=method,
@@ -936,15 +985,6 @@ class LeanInterface:
             # Writing to a dead process's stdin -> the pipe is gone; treat as death.
             raise _BridgeDied(f"stdio pipe broke: {exc}") from exc
         total_time = time.perf_counter() - started
-
-        try:
-            resp = json.loads(line)
-        except json.JSONDecodeError as exc:
-            return MethodResult(
-                method=method,
-                content=f"Malformed response from bridge: {line!r} ({exc})",
-                is_error=True,
-            )
 
         # Both success and error envelopes carry the import accounting; record it
         # before unwrapping the value so timing/cache stats are captured either way.
