@@ -209,3 +209,41 @@ unsafe def getSuccessfulAutomation (leanCode : String) (tactics : Array String) 
     return out
 
   | _ => return #[]
+
+
+
+/-- Returns information about each tactic used in declarations in the given module. -/
+@[expose_python fun x _ _ => getImportsFromModule x]
+unsafe def successfulAutomationAtEachGoal (mod : Name) (tactics : Array String) (tacticImports : Array Name) : CommandElabM <| Array (Array String) := do
+  initMetaSearchPath
+  let src ← moduleSource mod
+
+  let steps ← compilationStepsCached src (additionalImports := tacticImports.map (fun m => { module := m}))
+
+  let mut out := #[]
+
+  for step in steps do
+    for tree in step.trees do
+      for (ti, ctx) in tree.tactics do
+        -- dbg_trace "Trying to solve tactic {ti.name?.getD .anonymous} in declaration {ctx.parentDecl?.getD .anonymous} with tactics {tactics}"
+        let mut acc := #[]
+        for tac in tactics do
+          acc := acc.append <| ← ti.runMetaM ctx <| fun mvarId => do
+            try
+              let tacticStx ←
+                match Parser.runParserCategory (← getEnv) `tactic tac with
+                | .ok stx => pure stx
+                | .error err => throwError "could not parse tactic {repr tac}: {err}"
+              let remaining ← runTactic' mvarId tacticStx (ctx := { errToSorry := false })
+              let proof ← instantiateMVars (.mvar mvarId)
+              if remaining.isEmpty && (← mvarId.isAssigned) && !proof.hasSorry then
+                return #[tac]
+              return #[]
+            catch _ =>
+              -- dbg_trace "Error while trying tactic {tac} on goal {ti.name?.getD .anonymous} in declaration {ctx.parentDecl?.getD .anonymous}: {← e.toMessageData.format}"
+              return #[]
+        out := out.push acc
+  return out
+
+
+-- #eval successfulAutomationAtEachGoal `Mathlib.Algebra.QuadraticDiscriminant #["simp", "grind", "rfl"] #[]

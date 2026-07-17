@@ -111,11 +111,11 @@ initialize prefixEnvironmentCache : IO.Ref (Option (Array Import × String.Pos.R
 
 
 
-unsafe def compilationStepsCached (leanCode : String) : CommandElabM (Array IO.CompilationStep) := do
+unsafe def compilationStepsCached (leanCode : String) (additionalImports : Array Import := #[]) : CommandElabM (Array IO.CompilationStep) := do
   enableInitializersExecution
 
   let parsed ← parseImports'' leanCode "<input>"
-  let imports := parsed.imports
+  let imports := parsed.imports ++ additionalImports
   let headerPos := parsed.pos
 
   let mut source := removeHeader leanCode
