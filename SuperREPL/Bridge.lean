@@ -8,6 +8,7 @@ public import SuperREPL.BridgeInitializer
 public import SuperREPL.CheckingUtilities
 
 public import SuperREPL.CheckLean
+public import SuperREPL.GoalStateTools
 
 
 public section
