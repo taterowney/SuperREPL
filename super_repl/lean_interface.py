@@ -128,6 +128,44 @@ def _tree_rss_bytes(pid: int) -> int | None:
     return total
 
 
+def _descendant_procs(pid: int) -> list:
+    """The live descendants of ``pid`` — a bridge's actual Lean workers.
+
+    ``self._proc`` is only the ``lake`` launcher; the heavy Lean work runs in its
+    ``lean`` descendants (``lake -> lean -> lean``). Killing just the launcher
+    leaves those workers orphaned (reparented to init) and still holding memory,
+    so teardown enumerates them here and takes down the whole tree.
+
+    Must be called *while ``pid`` is still alive*: once the launcher exits its
+    children are reparented and can no longer be found by walking down from it.
+    Returns ``[]`` when psutil is unavailable or the walk fails; each returned
+    ``psutil.Process`` caches the pid's identity, so signalling it later is
+    guarded against pid reuse. Safe to call from any thread."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    try:
+        return psutil.Process(pid).children(recursive=True)
+    except Exception:
+        return []
+
+
+def _kill_procs(procs: list) -> None:
+    """SIGKILL every process in ``procs``, skipping any already gone.
+
+    Used to reap the Lean workers left behind when only the ``lake`` launcher is
+    signalled. psutil verifies each process's identity before signalling, so a
+    reused pid is skipped rather than mis-killed. Best-effort; safe on an empty
+    list (e.g. when psutil is unavailable)."""
+    for p in procs:
+        try:
+            p.kill()
+        except Exception:
+            # Already exited, reaped, or reused: nothing to kill here.
+            continue
+
+
 class _BridgeDied(Exception):
     """Raised internally when the bridge's stdio pipe closes mid-exchange (the
     process exited/crashed). Signals the worker to restart the process."""
@@ -911,12 +949,20 @@ class LeanInterface:
         return _tree_rss_bytes(proc.pid)
 
     async def _kill_proc(self) -> None:
-        """Ensure the current process is dead and reaped."""
+        """Ensure the current process tree is dead and reaped.
+
+        ``self._proc`` is only the ``lake`` launcher; its ``lean`` worker
+        descendants are killed too so they aren't orphaned (see
+        :func:`_descendant_procs`). Descendants are captured and signalled while
+        the launcher is still alive (their pids are stable and known-ours then),
+        and the launcher itself is killed before ``wait()`` reaps it, so no pid
+        we signal has been reaped/reused."""
         proc = self._proc
         self._proc = None
         if proc is None:
             return
         if proc.returncode is None:
+            _kill_procs(_descendant_procs(proc.pid))
             try:
                 proc.kill()
             except Exception:
@@ -1066,6 +1112,10 @@ class LeanInterface:
         proc = self._proc
         if proc is None:
             return
+        # Capture the Lean workers now, while the launcher is alive; once it
+        # exits they are reparented and can no longer be found by walking down
+        # from it. We kill any survivors after the launcher is gone.
+        workers = _descendant_procs(proc.pid) if proc.returncode is None else []
         if proc.returncode is None:
             # A blank line makes the REPL's read return empty and the loop exit
             # gracefully.
@@ -1084,6 +1134,9 @@ class LeanInterface:
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except asyncio.TimeoutError:
                     proc.kill()
+        # A graceful launcher exit doesn't necessarily take its Lean workers
+        # with it, so reap any that outlived it rather than orphaning them.
+        _kill_procs(workers)
         if self._stderr_task is not None:
             self._stderr_task.cancel()
 

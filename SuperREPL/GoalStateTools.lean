@@ -244,6 +244,3 @@ unsafe def successfulAutomationAtEachGoal (mod : Name) (tactics : Array String) 
               return #[]
         out := out.push acc
   return out
-
-
--- #eval successfulAutomationAtEachGoal `Mathlib.Algebra.QuadraticDiscriminant #["simp", "grind", "rfl"] #[]
