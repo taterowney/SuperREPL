@@ -83,8 +83,10 @@ Example::
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import logging
+import os
 import signal
 import subprocess
 import threading
@@ -133,14 +135,16 @@ def _descendant_procs(pid: int) -> list:
 
     ``self._proc`` is only the ``lake`` launcher; the heavy Lean work runs in its
     ``lean`` descendants (``lake -> lean -> lean``). Killing just the launcher
-    leaves those workers orphaned (reparented to init) and still holding memory,
-    so teardown enumerates them here and takes down the whole tree.
+    leaves those workers orphaned (reparented to init) and still holding memory.
 
-    Must be called *while ``pid`` is still alive*: once the launcher exits its
-    children are reparented and can no longer be found by walking down from it.
-    Returns ``[]`` when psutil is unavailable or the walk fails; each returned
-    ``psutil.Process`` caches the pid's identity, so signalling it later is
-    guarded against pid reuse. Safe to call from any thread."""
+    This walk is only the *secondary* teardown pass: it finds nothing that has
+    already been reparented (or that spawns between the snapshot and the kill),
+    which is why the primary reap is the process-group kill in
+    :func:`_kill_group`. It remains useful for anything that left the group.
+    Must be called while ``pid`` is still alive. Returns ``[]`` when psutil is
+    unavailable or the walk fails; each returned ``psutil.Process`` caches the
+    pid's identity, so signalling it later is guarded against pid reuse. Safe to
+    call from any thread."""
     try:
         import psutil
     except ImportError:
@@ -164,6 +168,113 @@ def _kill_procs(procs: list) -> None:
         except Exception:
             # Already exited, reaped, or reused: nothing to kill here.
             continue
+
+
+def _kill_group(pgid: int, sig: int = signal.SIGKILL) -> None:
+    """Signal the whole process group led by ``pgid``.
+
+    Bridges are spawned as their own group leaders (``start_new_session`` in
+    :meth:`LeanInterface._spawn_proc`), so a bridge's pgid is its launcher's
+    pid, and the group reaches every ``lean`` worker *regardless of
+    reparenting* — the failure mode that makes a downward PPID walk
+    insufficient. A pgid stays valid (and the pid unreusable) while any member
+    of the group is alive, including members whose parent already exited.
+    Best-effort: a fully-dead group raises ``ProcessLookupError``, which is the
+    success case."""
+    try:
+        os.killpg(pgid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _group_alive(pgid: int) -> bool:
+    """Whether process group ``pgid`` still has members (coarse: counts
+    zombies awaiting reap). ``PermissionError`` means something exists but is
+    not ours to signal — report it alive so verification stays loud."""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_survivors(pgid: int) -> list[tuple[int, int | None]]:
+    """``(pid, rss_bytes)`` for each live (non-zombie) process still in group
+    ``pgid``. Returns ``[]`` when psutil is unavailable — pair with
+    :func:`_group_alive` for a coarse existence check."""
+    try:
+        import psutil
+    except ImportError:
+        return []
+    out: list[tuple[int, int | None]] = []
+    for p in psutil.process_iter(["pid"]):
+        pid = p.info["pid"]
+        try:
+            if os.getpgid(pid) != pgid or p.status() == psutil.STATUS_ZOMBIE:
+                continue
+        except (psutil.Error, ProcessLookupError, PermissionError, OSError):
+            continue
+        try:
+            rss: int | None = p.memory_info().rss
+        except psutil.Error:
+            rss = None
+        out.append((pid, rss))
+    return out
+
+
+# Process groups of every live bridge, registered at spawn and pruned once the
+# group is verified dead. Bridges run in their own sessions, so a host-level
+# Ctrl-C / SIGTERM no longer reaches them through a shared process group; this
+# registry is what the host-side shutdown paths (`Server`'s signal handlers and
+# the atexit sweep below) use to take them down.
+_live_pgids: set[int] = set()
+_live_pgids_lock = threading.Lock()
+
+
+def _register_pgid(pgid: int) -> None:
+    with _live_pgids_lock:
+        _live_pgids.add(pgid)
+
+
+def _unregister_pgid(pgid: int) -> None:
+    with _live_pgids_lock:
+        _live_pgids.discard(pgid)
+
+
+def _signal_all_groups(sig: int) -> None:
+    """Deliver ``sig`` to every registered bridge process group. Used by the
+    host-side shutdown paths now that bridges no longer share the host's group.
+    Async-signal-safe enough to call from a signal handler: the registry lock is
+    only ever held briefly, and never by the main thread outside a handler."""
+    with _live_pgids_lock:
+        pgids = list(_live_pgids)
+    for pgid in pgids:
+        _kill_group(pgid, sig)
+
+
+def _reap_groups_at_exit() -> None:
+    """Last-resort sweep at interpreter exit: take down any bridge group still
+    registered — with the bridges in their own sessions, nothing else will.
+    SIGTERM first, so a worker thread still draining its pipe sees the
+    ``-SIGTERM`` exit as an intentional shutdown (`_SHUTDOWN_RETURNCODES`) and
+    does not respawn a doomed replacement mid-exit; SIGKILL whatever remains
+    after a short grace."""
+    with _live_pgids_lock:
+        pgids = list(_live_pgids)
+    if not pgids:
+        return
+    for pgid in pgids:
+        _kill_group(pgid, signal.SIGTERM)
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline and any(_group_alive(p) for p in pgids):
+        time.sleep(0.05)
+    for pgid in pgids:
+        _kill_group(pgid)
+
+
+atexit.register(_reap_groups_at_exit)
 
 
 class _BridgeDied(Exception):
@@ -273,11 +384,14 @@ _ALWAYS_MODULES: tuple[str, ...] = ("SuperREPL.DefaultTools",)
 _STREAM_LIMIT = 128 * 1024 * 1024  # 128 MiB
 
 # Process exit codes (negative = killed by signal -N) that mark a *deliberate*
-# teardown rather than a crash, so the worker must NOT spawn a replacement. A
-# Ctrl-C / `kill` delivered to the process group hits the Lean children too, and
-# the worker can see the resulting EOF before `close()` has run on the main
-# thread. SIGKILL is intentionally excluded: the crash-recovery path (and an
-# external `kill -9` of a wedged bridge) should still restart.
+# teardown rather than a crash, so the worker must NOT spawn a replacement.
+# Bridges run in their own sessions (see `_spawn_proc`), so a host Ctrl-C /
+# `kill` no longer reaches them through a shared process group; instead
+# `Server` forwards SIGINT/SIGTERM to each bridge group and the atexit sweep
+# sends SIGTERM first — and the worker can see the resulting EOF before
+# `close()` has run on the main thread. SIGKILL is intentionally excluded: the
+# crash-recovery path (and an external `kill -9` of a wedged bridge) should
+# still restart.
 _SHUTDOWN_RETURNCODES: frozenset[int] = frozenset({-int(signal.SIGINT), -int(signal.SIGTERM)})
 
 
@@ -318,6 +432,7 @@ class LeanInterface:
         cwd: str | Path | None = None,
         ready_timeout: float = 600.0,
         build: bool = True,
+        restart_on_timeout: bool = True,
     ) -> None:
         """Spawn the bridge for ``lean_modules`` and wait until it is ready.
 
@@ -336,6 +451,14 @@ class LeanInterface:
                 them (e.g. a pool building once up front, then spawning several
                 bridges concurrently) — concurrent ``lake build`` of the same
                 targets races on the shared build tree, so it must be done once.
+            restart_on_timeout: When true (default) a timed-out method call
+                replaces the bridge process. The bridge has no way to cancel a
+                call in flight, so without a restart it keeps elaborating the
+                abandoned request and every queued request burns its own timeout
+                budget waiting behind it (head-of-line blocking). The restart
+                costs the warm import cache but guarantees the next request a
+                clean process. Set false to keep the old leave-it-running
+                behaviour (late replies are discarded by id either way).
         """
         self.id = id
         self.cluster: int | None = None  # category pinned by the routing policy
@@ -363,6 +486,11 @@ class LeanInterface:
         self.cached_modules: list[str] = []
         self._closed = False
         self._restarts = 0  # how many times the process has been respawned
+        self._restart_on_timeout = restart_on_timeout
+        # Process groups whose kill could not be verified (survivors remained
+        # after SIGKILL + grace). Non-empty means memory is leaking; the
+        # MemoryManager alarms on it and the atexit sweep retries them.
+        self.leaked_pgids: set[int] = set()
 
         # Block until the process is up and has reported its methods.
         self._dispatch(self._async_setup())
@@ -423,12 +551,17 @@ class LeanInterface:
                 f"(exit {build.returncode}):\n{out.decode(errors='replace')}"
             )
 
+    def _bridge_cmd(self) -> list[str]:
+        """Command line for the bridge process. Overridable so tests can swap in
+        a scriptable fake bridge without a Lean toolchain."""
+        return ["lake", "exe", "bridge", "--import", ",".join(self.lean_modules)]
+
     async def _spawn_proc(self) -> None:
         """Spawn the bridge process, start draining its stderr, and consume the
         startup manifest. Reused for both initial setup and restarts; a fresh
         process starts with nothing cached, so the manifest tables and the
         cached-module snapshot are (re)populated here."""
-        cmd = ["lake", "exe", "bridge", "--import", ",".join(self.lean_modules)]
+        cmd = self._bridge_cmd()
         logger.info("Starting Lean bridge (id=%s): %s (cwd=%s)", self.id, " ".join(cmd), self._cwd)
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -437,7 +570,13 @@ class LeanInterface:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             limit=_STREAM_LIMIT,  # responses (esp. `cachedModules`) exceed the 64 KiB default
+            # Own session/process group, so teardown can `killpg` the whole tree
+            # even after workers reparent (see `_kill_group`). Detaches the
+            # bridge from the host's group: host SIGINT/SIGTERM must be
+            # forwarded explicitly (`Server` handlers / the atexit sweep).
+            start_new_session=True,
         )
+        _register_pgid(self._proc.pid)
 
         # Drain stderr so the process can't block on a full pipe; surface it
         # for debugging (lake build output, Lean errors, etc.).
@@ -863,9 +1002,11 @@ class LeanInterface:
 
         True when we are already closing (:attr:`_closed`), or when the process
         exited because of SIGINT/SIGTERM. The signal check closes a race: a
-        Ctrl-C/terminate sent to the whole process group kills the Lean child
-        too, and the worker (on its own background thread, immune to the main
-        thread's KeyboardInterrupt) can see the resulting EOF *before*
+        host Ctrl-C/terminate is forwarded to each bridge's process group (by
+        ``Server``'s signal handlers, or as SIGTERM by the atexit sweep — the
+        bridges run in their own sessions and no longer share the host's
+        group), and the worker (on its own background thread, immune to the
+        main thread's KeyboardInterrupt) can see the resulting EOF *before*
         :meth:`close` has run — which used to look like a crash and spawn a
         doomed replacement mid-shutdown.
         """
@@ -949,20 +1090,28 @@ class LeanInterface:
         return _tree_rss_bytes(proc.pid)
 
     async def _kill_proc(self) -> None:
-        """Ensure the current process tree is dead and reaped.
+        """Ensure the current process tree is dead, reaped, and *verified* dead.
 
-        ``self._proc`` is only the ``lake`` launcher; its ``lean`` worker
-        descendants are killed too so they aren't orphaned (see
-        :func:`_descendant_procs`). Descendants are captured and signalled while
-        the launcher is still alive (their pids are stable and known-ours then),
-        and the launcher itself is killed before ``wait()`` reaps it, so no pid
-        we signal has been reaped/reused."""
+        ``self._proc`` is only the ``lake`` launcher; the heavy Lean workers are
+        its descendants — but a downward PPID walk misses any worker whose
+        parent already exited (it reparents to init and drops out of the walk),
+        which orphaned one ~15 GiB worker per restart in production. The bridge
+        runs as its own process-group leader (``start_new_session`` in
+        :meth:`_spawn_proc`), so the group kill reaches every worker no matter
+        how it was reparented; the descendant walk is kept as a second pass for
+        anything that somehow left the group. Killing precedes the launcher's
+        ``wait()``, so the pgid (= launcher pid) has not been recycled.
+        Afterwards :meth:`_verify_group_dead` confirms the group is empty and
+        logs loudly (recording the leak) if it is not — a silent survivor is
+        exactly the failure that took a cgroup census to detect."""
         proc = self._proc
         self._proc = None
         if proc is None:
             return
+        workers = _descendant_procs(proc.pid) if proc.returncode is None else []
+        _kill_group(proc.pid)
+        _kill_procs(workers)
         if proc.returncode is None:
-            _kill_procs(_descendant_procs(proc.pid))
             try:
                 proc.kill()
             except Exception:
@@ -971,6 +1120,34 @@ class LeanInterface:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except Exception:
             pass
+        await self._verify_group_dead(proc.pid)
+
+    async def _verify_group_dead(self, pgid: int) -> None:
+        """Confirm the bridge's process group is empty, re-killing stragglers
+        for up to ~2s. On success the group is dropped from the shutdown
+        registry; on failure the survivors are logged with their RSS and the
+        pgid is recorded in :attr:`leaked_pgids` so the memory controller can
+        alarm and the atexit sweep retries it."""
+        deadline = time.monotonic() + 2.0
+        while _group_alive(pgid):
+            if time.monotonic() > deadline:
+                survivors = _group_survivors(pgid)
+                self.leaked_pgids.add(pgid)
+                logger.error(
+                    "Lean bridge (id=%s): process group %d survived SIGKILL; "
+                    "leaked %d process(es): %s. Their memory is NOT tracked by "
+                    "the pool's accounting.",
+                    self.id, pgid, len(survivors),
+                    [
+                        {"pid": pid, "rss": rss}
+                        for pid, rss in survivors
+                    ] or "pids unknown (psutil unavailable)",
+                )
+                return
+            _kill_group(pgid)
+            await asyncio.sleep(0.05)
+        _unregister_pgid(pgid)
+        self.leaked_pgids.discard(pgid)
 
     async def _execute_call(
         self,
@@ -1015,11 +1192,25 @@ class LeanInterface:
             await self._proc.stdin.drain()
             resp = await self._read_response(req_id, timeout)
         except asyncio.TimeoutError:
-            # A timeout is not a crash — the process is presumed alive (the call
-            # may still be running), so we surface an error result rather than
-            # restarting. Its late reply will be discarded by `_read_response`
-            # on the next call, matched out by its (now stale) id.
             logger.warning("Lean method %r timed out after %.1fs", name, timeout or 0.0)
+            if self._restart_on_timeout:
+                # The bridge cannot cancel a call in flight: left alone it keeps
+                # elaborating the abandoned request, and — one request at a time
+                # — every queued call burns its own timeout budget waiting
+                # behind it. Replace the process so the next request gets a
+                # clean slate (costs the warm import cache). The timed-out
+                # request itself is never retried.
+                try:
+                    await self._restart()
+                except Exception as exc:
+                    logger.error(
+                        "Lean bridge (id=%s) restart after timeout failed: %s "
+                        "(next request will retry the restart)",
+                        self.id, exc,
+                    )
+            # With restart_on_timeout=False the process is left running; its
+            # late reply is discarded by `_read_response` on the next call,
+            # matched out by its (now stale) id.
             return MethodResult(
                 method=method,
                 content=f"Method {name!r} timed out after {timeout}s",
@@ -1110,13 +1301,7 @@ class LeanInterface:
                     job.future.set_exception(RuntimeError("Lean bridge closed"))
 
         proc = self._proc
-        if proc is None:
-            return
-        # Capture the Lean workers now, while the launcher is alive; once it
-        # exits they are reparented and can no longer be found by walking down
-        # from it. We kill any survivors after the launcher is gone.
-        workers = _descendant_procs(proc.pid) if proc.returncode is None else []
-        if proc.returncode is None:
+        if proc is not None and proc.returncode is None:
             # A blank line makes the REPL's read return empty and the loop exit
             # gracefully.
             try:
@@ -1133,10 +1318,12 @@ class LeanInterface:
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=5)
                 except asyncio.TimeoutError:
-                    proc.kill()
-        # A graceful launcher exit doesn't necessarily take its Lean workers
-        # with it, so reap any that outlived it rather than orphaning them.
-        _kill_procs(workers)
+                    pass
+        # Whether the launcher exited gracefully, had to be terminated, or was
+        # already gone when close() ran (the case that used to reap nothing at
+        # all, orphaning its reparented workers), the group sweep in
+        # `_kill_proc` reaps every worker and verifies the group is empty.
+        await self._kill_proc()
         if self._stderr_task is not None:
             self._stderr_task.cancel()
 

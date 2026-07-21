@@ -23,6 +23,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 
 from .basic import Request
@@ -166,6 +167,138 @@ async def crash_recovery() -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Unit tests (fast, no Lean toolchain needed): `python -m super_repl.tests --unit`
+#
+# These encode the process-orphaning and timeout-cascade failure modes from the
+# 2026-07 production OOM (see the fix in `lean_interface._kill_proc` /
+# `_execute_call`): teardown must reap workers that were reparented away from
+# the launcher, must reap them even when the launcher died first, and a
+# timed-out call must not head-of-line-block the next request.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+# A stand-in for `lake exe bridge` speaking the same stdio protocol: manifest on
+# startup, then one JSON reply (echoing the request id) per blank-line-terminated
+# request. `slow` sleeps for `args.seconds`, simulating a runaway elaboration.
+_FAKE_BRIDGE = r'''
+import json, sys, time
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n\n")
+    sys.stdout.flush()
+emit([
+    {"name": "echo", "description": "", "input_schema": {}, "output": "String"},
+    {"name": "slow", "description": "", "input_schema": {}, "output": "String"},
+])
+buf = []
+for line in sys.stdin:
+    stripped = line.strip()
+    if stripped:
+        buf.append(stripped)
+        continue
+    if not buf:
+        break  # a lone blank line is the graceful-shutdown nudge
+    req = json.loads("".join(buf))
+    buf = []
+    if req.get("method") == "slow":
+        time.sleep(float(req.get("args", {}).get("seconds", 60)))
+    emit({"id": req.get("id"), "result": "success", "value": "ok",
+          "cachedModules": [], "importsTimeMs": 0, "importCacheMisses": 0})
+'''
+
+
+def _make_bare_iface() -> "object":
+    """A LeanInterface shell with just the state `_kill_proc` touches, so the
+    reap path can be exercised on a synthetic process tree without a bridge."""
+    from .lean_interface import LeanInterface
+
+    iface = LeanInterface.__new__(LeanInterface)
+    iface.id = 999
+    iface.leaked_pgids = set()
+    return iface
+
+
+async def _spawn_orphan_tree() -> "asyncio.subprocess.Process":
+    """A launcher whose grandchild is reparented to init (its parent exits
+    immediately) while staying in the launcher's process group — the tree shape
+    that escaped the old PPID-walk teardown and leaked ~15 GiB per restart."""
+    from .lean_interface import _register_pgid
+
+    proc = await asyncio.create_subprocess_exec(
+        "sh", "-c", 'sh -c "sleep 300 & " ; exec sleep 300',
+        start_new_session=True,
+    )
+    _register_pgid(proc.pid)
+    await asyncio.sleep(0.3)  # let the middle shell spawn the orphan and exit
+    return proc
+
+
+def _assert_group_dead(pgid: int) -> None:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return
+    os.killpg(pgid, signal.SIGKILL)  # don't leave the fixture behind
+    raise AssertionError(f"process group {pgid} survived teardown")
+
+
+async def reap_orphaned_grandchild() -> None:
+    """`_kill_proc` must take down a worker the descendant walk cannot see."""
+    iface = _make_bare_iface()
+    iface._proc = await _spawn_orphan_tree()
+    pgid = iface._proc.pid
+    await iface._kill_proc()
+    _assert_group_dead(pgid)
+    assert not iface.leaked_pgids, iface.leaked_pgids
+    logger.info("reap-orphaned-grandchild ok")
+
+
+async def reap_after_launcher_already_dead() -> None:
+    """close()-style teardown when the launcher exited first — the case that
+    previously reaped nothing at all (`workers = []` when returncode is set)."""
+    iface = _make_bare_iface()
+    proc = await _spawn_orphan_tree()
+    os.kill(proc.pid, signal.SIGKILL)
+    await proc.wait()  # launcher reaped; its workers live on in the group
+    iface._proc = proc
+    await iface._kill_proc()
+    _assert_group_dead(proc.pid)
+    assert not iface.leaked_pgids, iface.leaked_pgids
+    logger.info("reap-after-launcher-dead ok")
+
+
+async def timeout_restarts_and_unblocks() -> None:
+    """A timed-out call must not consume the next request's timeout budget:
+    the bridge is restarted, so a follow-up trivial call succeeds promptly
+    instead of queueing behind the abandoned 60s elaboration."""
+    from .lean_interface import LeanInterface
+
+    class _FakeBridgeInterface(LeanInterface):
+        def _bridge_cmd(self) -> list[str]:
+            return [sys.executable, "-u", "-c", _FAKE_BRIDGE]
+
+    iface = _FakeBridgeInterface([], id=998, build=False)
+    try:
+        r1 = await iface.call_method("slow", {"seconds": 60}, timeout=1.0)
+        assert r1.is_error, r1.content
+        started = time.perf_counter()
+        r2 = await iface.call_method("echo", {}, timeout=10.0)
+        elapsed = time.perf_counter() - started
+        assert not r2.is_error, f"echo failed after a timeout: {r2.content}"
+        assert iface._restarts == 1, f"expected 1 restart, saw {iface._restarts}"
+        assert elapsed < 10, f"echo blocked {elapsed:.1f}s behind the abandoned call"
+    finally:
+        iface.close()
+    logger.info("timeout-restarts-and-unblocks ok (follow-up served in %.2fs)", elapsed)
+
+
+async def unit_tests() -> None:
+    await reap_orphaned_grandchild()
+    await reap_after_launcher_already_dead()
+    await timeout_restarts_and_unblocks()
+    logger.info("all unit tests passed")
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # Entry point
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -195,11 +328,18 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--budget", type=int, default=0, help="max memory per bridge (GiB, 0=unlimited)")
     parser.add_argument("--crash", action="store_true",
                         help="also run the bridge crash-recovery test")
+    parser.add_argument("--unit", action="store_true",
+                        help="run only the fast process-reaping/timeout unit "
+                             "tests (no Lean toolchain needed)")
     parser.add_argument("--debug", action="store_true",
                         help="verbose logging, incl. aiohttp/httpx (or set DEBUG=1)")
     args = parser.parse_args(argv)
 
     _configure_logging(args.debug or _env_debug())
+
+    if args.unit:
+        asyncio.run(unit_tests())
+        return
 
     total_start = time.perf_counter()
     server = Server(num_processes=args.processes, lean_modules=[CHECK_MODULE], memory_budget=args.budget * 1024**3)

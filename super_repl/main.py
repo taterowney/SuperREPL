@@ -16,6 +16,7 @@ Execution is async: a process is a bridge with its own internal queue, so
 from __future__ import annotations
 
 import asyncio
+import signal
 import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -23,7 +24,7 @@ from time import time
 from typing import TYPE_CHECKING
 
 from .basic import Request
-from .lean_interface import LeanInterface, MethodResult
+from .lean_interface import LeanInterface, MethodResult, _signal_all_groups
 from .policy import AdaptivePolicy, RoutingPolicy
 from .service import DEFAULT_HOST, DEFAULT_PORT, make_app
 
@@ -66,6 +67,39 @@ class Server:
         # fails fast (tearing the pool down) rather than mid-traffic.
         self.memory = self._init_memory(memory_budget, memory_options)
 
+        # Bridges run in their own sessions (so teardown can kill the whole
+        # group), which detaches them from the host's process group — a Ctrl-C
+        # or SIGTERM at the host no longer reaches them by itself. Forward
+        # those signals explicitly so shutdown still takes the pool down.
+        self._install_signal_forwarding()
+
+    def _install_signal_forwarding(self) -> None:
+        """Forward SIGINT/SIGTERM to every live bridge process group, then chain
+        to the previously-installed handler (KeyboardInterrupt for SIGINT,
+        process death for SIGTERM). A bridge exiting with ``-SIGINT``/``-SIGTERM``
+        is recognised by its worker as an intentional shutdown, suppressing a
+        doomed respawn. Only possible from the main thread; elsewhere the
+        atexit sweep in ``lean_interface`` remains the fallback. The handlers
+        are left installed after :meth:`close` — with no live groups they are
+        no-ops that just chain."""
+        if threading.current_thread() is not threading.main_thread():
+            return
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            prev = signal.getsignal(sig)
+
+            def _handler(signum, frame, _prev=prev):
+                _signal_all_groups(signum)
+                if callable(_prev):
+                    _prev(signum, frame)
+                elif _prev == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    signal.raise_signal(signum)
+
+            try:
+                signal.signal(sig, _handler)
+            except (ValueError, OSError):  # non-main interpreter, etc.
+                return
+
         # HTTP serving state (see `serve` / `url` / `stop_serving`).
         self._http_loop: asyncio.AbstractEventLoop | None = None
         self._http_thread: threading.Thread | None = None
@@ -75,9 +109,10 @@ class Server:
     def _init_memory(self, memory_budget: int | None,
                      memory_options: dict | None) -> "MemoryManager | None":
         """Build and arm the memory-budget guard, or return ``None`` when no
-        budget is requested. On a failed startup fit the already-spawned pool is
-        torn down before the error propagates so no live processes leak."""
-        if memory_budget is None:
+        budget is requested (``None`` or 0, which callers use for "unlimited").
+        On a failed startup fit the already-spawned pool is torn down before the
+        error propagates so no live processes leak."""
+        if not memory_budget:
             return None
         from .memory import MemoryManager
 
